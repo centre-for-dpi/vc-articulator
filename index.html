@@ -1,291 +1,4 @@
 <html lang="en"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        let requestId = 0;
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = requestId++;
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream
-                resolve(new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers
-                }));
-              },
-              reject,
-              channelId
-            });
-            
-            window.parent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          if (event.data.type === 'takeScreenshot') {
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              window.parent.postMessage({
-                type: 'screenshotError',
-                error: new Error('Root element not found'),
-              }, '*');
-            }
-            const screenshot = await htmlToImage.toPng(rootElement, {
-              imagePlaceholder:
-                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-            });
-            window.parent.postMessage({
-              type: 'screenshotData',
-              data: screenshot,
-            }, '*');
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              window.parent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            window.parent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            window.parent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          window.parent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Verifiable Credentials — CDPI</title>
@@ -878,17 +591,32 @@ input[type=range] {
 #site-footer {
   border-top: 1px solid var(--border);
   background: var(--surface);
-  height: 96px;
+  min-height: 96px;
   display: flex; align-items: center; justify-content: center;
+  padding: 1.25rem 2rem;
 }
 .footer-inner {
-  display: flex; align-items: center; gap: 0.75rem;
-  flex-wrap: wrap; justify-content: center;
-  font-size: 0.8rem; color: var(--ink3);
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; max-width: 1100px;
+  flex-wrap: wrap; gap: 1rem;
 }
-.footer-beta { font-weight: 600; color: var(--ink2); }
-.footer-sep { color: var(--border); }
-.footer-contact { color: var(--ink3); }
+.footer-left {
+  display: flex; align-items: center; gap: 0.75rem;
+}
+.footer-cdpi {
+  font-size: 0.8rem; color: var(--ink3); line-height: 1.6;
+}
+.footer-cdpi a {
+  color: var(--ink2); text-decoration: none; font-weight: 500;
+}
+.footer-cdpi a:hover { text-decoration: underline; }
+.footer-website { color: var(--amber) !important; font-weight: 400 !important; font-size: 0.78rem; }
+.footer-right {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 0.25rem;
+}
+.footer-beta { font-weight: 600; color: var(--ink2); font-size: 0.8rem; }
+.footer-sep { display: none; }
+.footer-contact { color: var(--ink3); font-size: 0.8rem; white-space: nowrap; }
 .footer-contact a { color: var(--amber); text-decoration: none; }
 .footer-contact a:hover { text-decoration: underline; }
 
@@ -897,28 +625,31 @@ input[type=range] {
   .logo-main { font-size: 1rem; }
   .forgery-panels { grid-template-columns: 1fr; }
   .actor-header { grid-template-columns: 1fr; }
+  #site-footer { padding: 1.5rem 1.25rem; min-height: auto; }
+  .footer-inner { flex-direction: column; align-items: flex-start; gap: 1rem; }
+  .footer-right { align-items: flex-start; }
+  .footer-contact { white-space: normal; }
 }
 </style>
 </head>
-<body id="artifacts-component-root-html">
+<body>
 
 <!-- ══ HEADER ══ -->
 <header id="header">
   <div class="logo">
     <span class="logo-main">Verifiable Credentials</span>
-    <span class="logo-by">by CDPI</span>
   </div>
   <nav>
-    <button class="nav-btn active" id="nav0">WHY DO I<br>need VCs?</button>
+    <button class="nav-btn" id="nav0">WHY DO I<br>need VCs?</button>
     <button class="nav-btn" id="nav1">HOW MUCH WILL<br>VCs cost?</button>
-    <button class="nav-btn" id="nav2">HOW DO I<br>build VCs?</button>
+    <button class="nav-btn active" id="nav2">HOW DO I<br>build VCs?</button>
   </nav>
 </header>
 
 <!-- ══════════════════════════════════
      PAGE 1 — FORGERY DEMO
 ══════════════════════════════════ -->
-<section class="sec on" id="sec0">
+<section class="sec" id="sec0">
   <div class="page-title">Can this document be forged?</div>
   <div class="page-sub">Upload any identity document — we'll show you how easy forgery is, and why Verifiable Credentials eliminate the risk.</div>
 
@@ -1019,21 +750,6 @@ input[type=range] {
       <span class="spill base active" data-scenario="base">Base</span>
       <span class="spill optimistic" data-scenario="optimistic">Optimistic</span>
     </div>
-    <h3>Digital Infrastructure Enabled</h3>
-    <div class="toggle-grid">
-      <div class="toggle-item on" id="tog0" data-tog="0">
-        <span class="toggle-label">Digital ID</span>
-        <div class="toggle-switch"></div>
-      </div>
-      <div class="toggle-item on" id="tog1" data-tog="1">
-        <span class="toggle-label">Shared KYC</span>
-        <div class="toggle-switch"></div>
-      </div>
-      <div class="toggle-item" id="tog2" data-tog="2">
-        <span class="toggle-label">Govt Wallet</span>
-        <div class="toggle-switch"></div>
-      </div>
-    </div>
   </div>
 
   <!-- ROI Hero -->
@@ -1047,7 +763,7 @@ input[type=range] {
     <div class="econ-card">
       <div class="econ-label">Manual KYC cost avoided</div>
       <div class="econ-val" id="econManualCost">$25.7B</div>
-      <div class="econ-sub">at $6/check (mid-point of $4–8 range, MicroSave 2023)</div>
+      <div class="econ-sub">at $6/check (mid-point of $4–8 range)*</div>
     </div>
     <div class="econ-card">
       <div class="econ-label">VC verification cost</div>
@@ -1108,8 +824,8 @@ input[type=range] {
         <div class="actor-unit-label" style="margin-top:0.3rem">vs $4–8 manual KYC</div>
       </div>
       <div class="actor-right">
-        <div class="actor-scale">Instant cryptographic check replaces 3–5 day manual review. Manual KYC costs $4–8/check; VC fee range $0.06–0.75/check.</div>
-        <div class="actor-case">📍 MicroSave 2023 · UIDAI fee schedule</div>
+        <div class="actor-scale">Instant cryptographic check replaces 3–5 day manual review. Manual KYC costs $4–8/check*; VC fee range $0.06–0.75/check.</div>
+        <div class="actor-case">📍 UIDAI fee schedule · $4–8 range is estimated*</div>
       </div>
     </div>
   </div>
@@ -1152,7 +868,7 @@ input[type=range] {
     </div>
   </div>
 
-  <div class="data-note" style="margin-top:-0.5rem;margin-bottom:0.5rem">📚 Sourced figures: UIDAI FY2024-25 Annual Report · MicroSave 2023 · CDPI rollout data (T&amp;T, Brazil)</div>
+  <div class="data-note" style="margin-top:-0.5rem;margin-bottom:0.5rem">📚 Sourced figures: UIDAI FY2024-25 Annual Report · CDPI rollout data (T&amp;T, Brazil)</div>
   <div class="data-note" style="margin-bottom:1.5rem">* Estimated figures based on typical government service delivery benchmarks.</div>
 
   <!-- Sector extrapolation (collapsible) -->
@@ -1201,60 +917,39 @@ input[type=range] {
 <!-- ══════════════════════════════════
      PAGE 3 — HOW TO BUILD
 ══════════════════════════════════ -->
-<section class="sec" id="sec2">
+<section class="sec on" id="sec2">
   <div class="page-title">How do I build VCs?</div>
   <div class="page-sub">Standards, platforms and architecture — tailored to your sector.</div>
+
+  <div style="margin-bottom:1.75rem;">
+    <a href="https://vc.cdpi.dev/" target="_blank" style="display:inline-flex;align-items:center;gap:0.4rem;font-size:0.875rem;color:var(--amber);text-decoration:none;font-weight:600;border-bottom:1.5px solid var(--amber);padding-bottom:1px;">
+      Read the Vision Paper →
+    </a>
+  </div>
 
   <div class="sector-sel-row">
     <label>Select sector:</label>
     <select id="sectorSelect3"><option value="national_id">National ID</option><option value="education">Education</option><option value="drivers_licence">Driver's Licence</option><option value="sme_identity">SME Identity</option><option value="healthcare">Healthcare</option><option value="professional">Professional Licences</option><option value="age_verification">Age Verification</option><option value="supply_chain">Supply Chain</option><option value="tourism">Tourism / Travel</option><option value="agriculture">Agriculture / ESG</option><option value="gov_digital">Gov Digital Services</option></select>
   </div>
 
-  <div id="p3Content"><h2>Recommended Standards</h2><div class="pills-row"><span class="pill pill-blue">W3C VC Data Model</span><span class="pill pill-green">ISO 18013-5 mDL</span><span class="pill pill-amber">OID4VC</span></div><h2>Open-Source DPG Platforms</h2><div class="dpg-grid">
-    <div class="dpg-card">
-      <div class="dpg-name">INJI</div>
-      <div class="dpg-desc">MOSIP-aligned wallet and issuance platform. Proven at national scale in multiple countries.</div>
-    </div>
-    <div class="dpg-card">
-      <div class="dpg-name">walt.id</div>
-      <div class="dpg-desc">Enterprise-grade SSI stack. Full W3C VC + OID4VC support with REST APIs.</div>
-    </div></div><div class="note" style="margin-bottom:1.25rem"><strong>Why these choices:</strong> National ID requires both physical (mDL) and digital (W3C VC) formats. OID4VC ensures wallet interoperability. INJI provides a proven national-scale deployment path; walt.id suits custom enterprise integration.</div><h2>The 4-Layer Architecture Stack</h2><div class="layer-stack"><div class="layer layer-l1">
-      <div class="layer-num">L1</div>
-      <div class="layer-body">
-        <div class="layer-title">Identifiers</div>
-        <div class="layer-desc">DID:web or DID:jwk for government issuers. Linked to existing National ID registry.</div>
-      </div>
-    </div><div class="layer layer-l2">
-      <div class="layer-num">L2</div>
-      <div class="layer-body">
-        <div class="layer-title">Format</div>
-        <div class="layer-desc">W3C VC JSON-LD for digital presentation + ISO mDL for physical/mobile driver use.</div>
-      </div>
-    </div><div class="layer layer-l3">
-      <div class="layer-num">L3</div>
-      <div class="layer-body">
-        <div class="layer-title">Transport</div>
-        <div class="layer-desc">OID4VCI for issuance, OID4VP for presentation. Works across wallets.</div>
-      </div>
-    </div><div class="layer layer-l4">
-      <div class="layer-num">L4</div>
-      <div class="layer-body">
-        <div class="layer-title">Trust</div>
-        <div class="layer-desc">Government-run Trust Registry. Anchored to national PKI infrastructure.</div>
-      </div>
-    </div></div><div class="divider"></div></div>
+  <div id="p3Content"><p style="font-size:0.95rem;color:var(--ink2);line-height:1.7;margin-bottom:1.5rem;">Digital passport, national ID, or government identity wallet. Requires maximum governmental interoperability and a solid legal basis.</p><h3 style="margin-bottom:0.6rem;">Credentialing Priorities</h3><div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-bottom:1.75rem;"><span style="display:inline-flex;align-items:center;padding:0.35rem 0.9rem;border-radius:3px;background:#c2185b18;border:1px solid #c2185b55;font-size:0.78rem;font-weight:600;color:#c2185b;letter-spacing:0.03em;text-transform:uppercase;">Interoperability</span><span style="display:inline-flex;align-items:center;padding:0.35rem 0.9rem;border-radius:3px;background:#1e3a6e18;border:1px solid #1e3a6e55;font-size:0.78rem;font-weight:600;color:#1e3a6e;letter-spacing:0.03em;text-transform:uppercase;">Offline Use</span><span style="display:inline-flex;align-items:center;padding:0.35rem 0.9rem;border-radius:3px;background:#1e6b4518;border:1px solid #1e6b4555;font-size:0.78rem;font-weight:600;color:#1e6b45;letter-spacing:0.03em;text-transform:uppercase;">Adoption</span></div><h3 style="margin-bottom:0.5rem;">Primary Standards</h3><div class="pills-row" style="margin-bottom:1.25rem;"><span class="pill pill-purple">EBSI / eIDAS 2.0</span><span class="pill pill-green">mDL ISO 18013-5</span><span class="pill pill-amber">OID4VC</span></div><h3 style="margin-bottom:0.5rem;">Complementary</h3><div class="pills-row" style="margin-bottom:1.5rem;"><span class="pill pill-blue">W3C VC</span><span class="pill pill-green">SD-JWT VC</span></div><div class="divider"></div></div>
 
   <div class="cta-section">
     <div class="cta-title">Ready to deploy Verifiable Credentials?</div>
     <div class="cta-sub">CDPI provides pro bono advisory to governments.</div>
-    <a class="btn" href="mailto:info@cdpi.dev">Contact CDPI for advisory →</a>
-    <div style="margin-top:1.25rem;font-size:0.8rem;opacity:0.7">
-      Source: <a href="https://vc-use-cases.cdpi.dev/vc-cheatsheet.html" target="_blank" style="color:#a3e635;text-underline-offset:3px">CDPI VC Cheatsheet</a>
+    <div style="display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;margin-top:0.5rem;">
+      <a class="btn" href="/cdn-cgi/l/email-protection#bcd5d2dad3fcdfd8ccd592d8d9ca" style="background:#fff;color:var(--green);min-width:180px;justify-content:center;">
+        Contact CDPI →
+      </a>
+      <a class="btn" href="https://vc-use-cases.cdpi.dev/" target="_blank" style="background:transparent;border:1.5px solid rgba(255,255,255,0.5);color:#fff;min-width:180px;justify-content:center;flex-direction:column;align-items:center;gap:0.15rem;padding:0.7rem 1.5rem;">
+        <span>Dive Deeper →</span>
+        <span style="font-size:0.72rem;font-weight:400;opacity:0.75;">Design choices, standards, sandbox</span>
+      </a>
     </div>
   </div>
 </section>
 
-<script>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
 // ══════════════════════════════════
 //  PAGE NAVIGATION
 // ══════════════════════════════════
@@ -1716,209 +1411,151 @@ function updateSectorExtrap() {
 // ══════════════════════════════════
 //  PAGE 3 — HOW TO BUILD
 // ══════════════════════════════════
+// Data sourced exactly from vc-use-cases.cdpi.dev
 const SECTOR_DATA = {
   national_id: {
-    standards: [
-      { label: 'W3C VC Data Model', cls: 'pill-blue' },
-      { label: 'ISO 18013-5 mDL', cls: 'pill-green' },
+    description: 'Digital passport, national ID, or government identity wallet. Requires maximum governmental interoperability and a solid legal basis.',
+    priorities: ['Interoperability', 'Offline Use', 'Adoption'],
+    primary: [
+      { label: 'EBSI / eIDAS 2.0', cls: 'pill-purple' },
+      { label: 'mDL ISO 18013-5', cls: 'pill-green' },
       { label: 'OID4VC', cls: 'pill-amber' }
     ],
-    platforms: [
-      { name: 'INJI', desc: 'MOSIP-aligned wallet and issuance platform. Proven at national scale in multiple countries.' },
-      { name: 'walt.id', desc: 'Enterprise-grade SSI stack. Full W3C VC + OID4VC support with REST APIs.' }
+    secondary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'SD-JWT VC', cls: 'pill-green' }
     ],
-    rationale: 'National ID requires both physical (mDL) and digital (W3C VC) formats. OID4VC ensures wallet interoperability. INJI provides a proven national-scale deployment path; walt.id suits custom enterprise integration.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'DID:web or DID:jwk for government issuers. Linked to existing National ID registry.' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC JSON-LD for digital presentation + ISO mDL for physical/mobile driver use.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VCI for issuance, OID4VP for presentation. Works across wallets.' },
-      { num: 'L4', label: 'Trust', desc: 'Government-run Trust Registry. Anchored to national PKI infrastructure.' }
-    ]
+    warning: null
   },
   education: {
-    standards: [
-      { label: 'W3C VC Data Model', cls: 'pill-blue' },
-      { label: 'OID4VC', cls: 'pill-amber' },
-      { label: 'Open Badges 3.0', cls: 'pill-purple' }
+    description: 'Degrees, certificates, micro-credentials, and learning portfolios verifiable by employers or academic institutions globally.',
+    priorities: ['Interoperability', 'Privacy', 'Adoption'],
+    primary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' }
     ],
-    platforms: [
-      { name: 'CREDEBL', desc: 'Open-source platform purpose-built for education credentials. AnonCreds and W3C VC support.' },
-      { name: 'walt.id', desc: 'Supports Open Badges 3.0 and W3C VC. Used by European universities.' }
+    secondary: [
+      { label: 'EBSI', cls: 'pill-purple' },
+      { label: 'SD-JWT VC', cls: 'pill-green' }
     ],
-    rationale: 'Education VCs must be portable for a lifetime — W3C VC provides longevity. Open Badges 3.0 ensures recognition by employers globally. OID4VC transport ensures any wallet can receive transcripts.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'DID:web for institutions. Students use wallet-generated DIDs (DID:key or DID:jwk).' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC + Open Badges 3.0 schema. Supports selective disclosure for privacy.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VCI for issuance at graduation. OID4VP for employer verification.' },
-      { num: 'L4', label: 'Trust', desc: 'Accreditation body acts as Trust Anchor. Cross-border: use EBSI or EDUCAUSE registries.' }
-    ]
+    warning: null
   },
   drivers_licence: {
-    standards: [
-      { label: 'ISO 18013-5 mDL', cls: 'pill-green' },
+    description: "Digital version of the driver's license. The paradigmatic use case for offline physical presentation, age verification, and minimal data disclosure.",
+    priorities: ['Offline Use', 'Interoperability', 'Adoption'],
+    primary: [
+      { label: 'mDL ISO 18013-5', cls: 'pill-green' }
+    ],
+    secondary: [
+      { label: 'SD-JWT VC', cls: 'pill-green' },
       { label: 'OID4VC', cls: 'pill-amber' }
     ],
-    platforms: [
-      { name: 'INJI', desc: 'MOSIP-based wallet with mDL support. Government-grade security.' },
-      { name: 'walt.id', desc: 'Flexible mDL + W3C VC. Integrates with existing DMV/DVLA systems.' }
-    ],
-    rationale: "ISO 18013-5 is the global standard for mobile driving licences, adopted by 40+ jurisdictions. OID4VC provides the digital transport layer for online use cases beyond roadside presentation.",
-    warning: '⚠️ Apple Wallet only supports ISO mDoc format — ensure your mDL implementation is mDoc-compatible for Apple device holders.',
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'Device-bound keys per ISO 18013-5. No persistent DID needed for holder.' },
-      { num: 'L2', label: 'Format', desc: 'ISO mDL (mDoc) as primary format. W3C VC for online age/identity proofs.' },
-      { num: 'L3', label: 'Transport', desc: 'NFC/BLE for roadside (ISO 18013-5 Part 5). OID4VP for online verification.' },
-      { num: 'L4', label: 'Trust', desc: 'National DMV as Issuer. IACA (Intl Authority for mDL) trust framework.' }
-    ]
+    warning: '⚠️ Apple Wallet only supports ISO mDoc format — ensure your mDL implementation is mDoc-compatible for Apple device holders.'
   },
   sme_identity: {
-    standards: [
+    description: 'SME accreditation for public tenders, bank onboarding, customs, and B2B e-commerce. Includes power of attorney and legal entity credentials.',
+    priorities: ['Interoperability', 'Adoption'],
+    primary: [
       { label: 'EBSI / eIDAS 2.0', cls: 'pill-purple' },
-      { label: 'W3C VC Data Model', cls: 'pill-blue' }
+      { label: 'W3C VC', cls: 'pill-blue' }
     ],
-    platforms: [
-      { name: 'walt.id', desc: 'Leading EBSI-compliant platform. Used by EU governments for legal entity VCs.' },
-      { name: 'CREDEBL', desc: 'Open-source, adaptable for non-EU SME registries with W3C VC.' }
+    secondary: [
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'SD-JWT VC', cls: 'pill-green' }
     ],
-    rationale: 'SME identity needs legal entity credentials (LEI, company reg number). EBSI provides the European framework; W3C VC works globally. Cross-border trade requires both formats.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'DID:ebsi for EU entities. DID:web mapped to company domain globally.' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC with Legal Entity schema. Maps to LEI (Legal Entity Identifier).' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VCI for registration authority issuance. OID4VP for B2B presentation.' },
-      { num: 'L4', label: 'Trust', desc: 'Business registry (Companies House, MCA) as Trust Anchor. GLEIF for LEI.' }
-    ]
+    warning: null
   },
   healthcare: {
-    standards: [
+    description: 'Portable medical records, digital prescriptions, vaccination certificates, and healthcare professional accreditation.',
+    priorities: ['Privacy', 'Interoperability'],
+    primary: [
       { label: 'AnonCreds (ZKP)', cls: 'pill-purple' },
-      { label: 'OID4VC', cls: 'pill-amber' },
-      { label: 'HL7 FHIR', cls: 'pill-blue' }
+      { label: 'SD-JWT VC', cls: 'pill-green' }
     ],
-    platforms: [
-      { name: 'CREDEBL', desc: 'AnonCreds support for privacy-preserving health credentials. ZKP proofs without revealing underlying data.' }
+    secondary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' }
     ],
-    rationale: 'Healthcare VCs require maximum privacy — AnonCreds enables zero-knowledge proofs (e.g. "patient is vaccinated" without revealing identity). FHIR integration ensures compatibility with existing health IT.',
-    warning: '⚠️ DIDComm transport only — OID4VP not yet available for AnonCreds. Plan for migration as standards evolve.',
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'Pairwise DIDs per issuer-holder relationship. Prevents correlation across providers.' },
-      { num: 'L2', label: 'Format', desc: 'AnonCreds for ZKP health proofs. W3C VC for vaccine certificates (WHO DDCC).' },
-      { num: 'L3', label: 'Transport', desc: 'DIDComm v2 currently. OID4VC migration path planned for 2025-26.' },
-      { num: 'L4', label: 'Trust', desc: 'Health ministry as Trust Anchor. WHO DDCC framework for cross-border.' }
-    ]
+    warning: '⚠️ AnonCreds currently only works over DIDComm — OID4VP not yet supported. Plan for migration as standards evolve.'
   },
   professional: {
-    standards: [
-      { label: 'W3C VC Data Model', cls: 'pill-blue' },
-      { label: 'EBSI', cls: 'pill-purple' },
-      { label: 'OID4VC', cls: 'pill-amber' }
-    ],
-    platforms: [
-      { name: 'walt.id', desc: 'EBSI-native for European professional licences. REST APIs for issuing body integration.' },
-      { name: 'INJI', desc: 'Proven for government-issued professional credentials at national scale.' }
-    ],
-    rationale: 'Professional licences must be verifiable cross-border (e.g. doctors, engineers). W3C VC provides the format; EBSI enables EU mutual recognition; OID4VC transport ensures employer wallet compatibility.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'DID:web for professional bodies. Individual practitioners use wallet DIDs.' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC with Professional Credential schema. Includes licence number, scope, expiry.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VP for employer/regulator verification. Presentation on mobile via wallet.' },
-      { num: 'L4', label: 'Trust', desc: 'Regulatory body (BMA, Bar Council, PEO) as Trust Anchor. EBSI for EU recognition.' }
-    ]
-  },
-  age_verification: {
-    standards: [
-      { label: 'AnonCreds (ZKP)', cls: 'pill-purple' },
-      { label: 'ISO 18013-5 mDL', cls: 'pill-green' }
-    ],
-    platforms: [
-      { name: 'CREDEBL', desc: 'AnonCreds for ZKP age proofs — prove "over 18" without revealing birthdate.' },
-      { name: 'INJI', desc: 'mDL-based age verification. Interoperates with Apple/Google Wallet.' }
-    ],
-    rationale: 'Age verification is the privacy-preservation use case. AnonCreds ZKP enables binary proofs ("is over 18") without revealing identity or date of birth — ideal for online platforms.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'Ephemeral holder DIDs per session. No persistent linkability across services.' },
-      { num: 'L2', label: 'Format', desc: 'AnonCreds ZKP for pure age proofs. ISO mDL age_over_18 element for physical.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VP for online verification. NFC/BLE for physical (mDL).' },
-      { num: 'L4', label: 'Trust', desc: 'National ID authority or DMV as Trust Anchor for the source credential.' }
-    ]
-  },
-  supply_chain: {
-    standards: [
-      { label: 'W3C VC Data Model', cls: 'pill-blue' },
-      { label: 'OID4VC', cls: 'pill-amber' },
-      { label: 'GS1 Standards', cls: 'pill-green' }
-    ],
-    platforms: [
-      { name: 'walt.id', desc: 'Enterprise-grade VC issuance for supply chain proofs. REST API for ERP integration.' }
-    ],
-    rationale: 'Supply chain VCs attach to physical goods (via GS1/QR codes). W3C VC carries provenance data; OID4VC enables B2B digital transfer. GS1 ensures barcode/RFID interoperability.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'DID:web for manufacturers/certifiers. GS1 GLN mapped to DID for supply chain entities.' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC with GS1 product provenance schema. Supports batch/lot attestation.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VP for customs/buyer verification. QR code for physical goods attachment.' },
-      { num: 'L4', label: 'Trust', desc: 'Certifying body (organic, fair trade, ISO) as Trust Anchor. GS1 registry.' }
-    ]
-  },
-  tourism: {
-    standards: [
-      { label: 'ISO 18013-5 mDL', cls: 'pill-green' },
-      { label: 'OID4VC', cls: 'pill-amber' }
-    ],
-    platforms: [
-      { name: 'INJI', desc: 'Travel document integration. Supports ePassport + mDL use cases.' },
-      { name: 'walt.id', desc: 'Flexible travel credential stack. Hotel/airline integration APIs.' }
-    ],
-    rationale: 'Travel requires ISO-standard digital travel credentials for border control interoperability. OID4VC enables airline/hotel check-in flows. mDL provides the physical fallback.',
-    warning: '⚠️ Apple Wallet only supports ISO mDoc format. Test mDoc compatibility before deployment.',
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'Passport-linked DIDs. ICAO eMRTD as identity root.' },
-      { num: 'L2', label: 'Format', desc: 'ISO mDL / mDoc for mobile travel document. W3C VC for hotel/venue proofs.' },
-      { num: 'L3', label: 'Transport', desc: 'NFC for border control (ISO 18013-5). OID4VP for hotel/airline check-in.' },
-      { num: 'L4', label: 'Trust', desc: 'Issuing state passport authority. ICAO trust framework for cross-border.' }
-    ]
-  },
-  agriculture: {
-    standards: [
-      { label: 'W3C VC Data Model', cls: 'pill-blue' },
-      { label: 'OID4VC', cls: 'pill-amber' },
-      { label: 'GS1 / ISO 14064', cls: 'pill-green' }
-    ],
-    platforms: [
-      { name: 'walt.id', desc: 'Enterprise VC for ESG attestations. Integrates with carbon registries.' }
-    ],
-    rationale: 'Agriculture VCs enable verifiable farm-to-fork provenance and carbon credit attestation. W3C VC carries ESG data; ISO 14064 alignment enables carbon market participation.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'DID:web for certifying bodies. Farm/plot identifiers via GS1 GLN.' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC with AGRI-VC schema. Supports organic, fair trade, carbon attestation.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VP for buyer/regulator verification. QR code for physical product.' },
-      { num: 'L4', label: 'Trust', desc: 'Certification body (Rainforest Alliance, Verra) as Trust Anchor.' }
-    ]
-  },
-  gov_digital: {
-    standards: [
-      { label: 'W3C VC Data Model', cls: 'pill-blue' },
-      { label: 'OID4VC', cls: 'pill-amber' },
+    description: 'Authorization to practice regulated professions: lawyers, doctors, accountants, engineers, pharmacists. Verification by professional associations.',
+    priorities: ['Interoperability', 'Adoption', 'Privacy'],
+    primary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
       { label: 'EBSI', cls: 'pill-purple' }
     ],
-    platforms: [
-      { name: 'INJI', desc: 'Proven government service stack. DigiLocker-style deployment for 1B+ users.' },
-      { name: 'walt.id', desc: 'EBSI-compliant for EU governments. REST API for legacy system integration.' },
-      { name: 'QuarkID', desc: 'Latin American government stack. ZKP + W3C VC for citizen services.' }
+    secondary: [
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'SD-JWT VC', cls: 'pill-green' }
     ],
-    rationale: 'Government digital services require a single VC wallet for all services — W3C VC provides the format, OID4VC the transport. EBSI enables cross-border EU service access. QuarkID covers LatAm.',
-    warning: null,
-    layers: [
-      { num: 'L1', label: 'Identifiers', desc: 'Government-issued DIDs anchored to national identity registry.' },
-      { num: 'L2', label: 'Format', desc: 'W3C VC for all service credentials. SD-JWT for selective disclosure.' },
-      { num: 'L3', label: 'Transport', desc: 'OID4VCI for government issuance. OID4VP for service authentication.' },
-      { num: 'L4', label: 'Trust', desc: 'National e-Government framework as Trust Anchor. Federated across ministries.' }
-    ]
+    warning: null
+  },
+  age_verification: {
+    description: 'Proof of legal age for alcohol, gambling, adult content, or financial services — without revealing date of birth or full identity.',
+    priorities: ['Privacy', 'Offline Use', 'Interoperability'],
+    primary: [
+      { label: 'AnonCreds (ZKP)', cls: 'pill-purple' },
+      { label: 'SD-JWT VC', cls: 'pill-green' },
+      { label: 'mDL ISO 18013-5', cls: 'pill-green' }
+    ],
+    secondary: [
+      { label: 'W3C VC', cls: 'pill-blue' }
+    ],
+    warning: null
+  },
+  supply_chain: {
+    description: 'Product traceability, certificates of origin, ESG sustainability audits, customs, and quality certifications throughout the supply chain.',
+    priorities: ['Interoperability', 'Adoption'],
+    primary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    secondary: [
+      { label: 'SD-JWT VC', cls: 'pill-green' },
+      { label: 'EBSI', cls: 'pill-purple' }
+    ],
+    warning: null
+  },
+  tourism: {
+    description: 'Interoperable travel credentials: digital passports, visas, traveler health data, lounge access, paperless check-in, and digital border crossing.',
+    priorities: ['Offline Use', 'Interoperability', 'Adoption'],
+    primary: [
+      { label: 'mDL ISO 18013-5', cls: 'pill-green' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    secondary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'SD-JWT VC', cls: 'pill-green' }
+    ],
+    warning: '⚠️ Apple Wallet only supports ISO mDoc format — test mDoc compatibility before deployment.'
+  },
+  agriculture: {
+    description: 'Certificates of origin, product traceability from farm to consumer, phytosanitary compliance, farmer credentials, and access to agricultural financing.',
+    priorities: ['Interoperability', 'Adoption'],
+    primary: [
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    secondary: [
+      { label: 'SD-JWT VC', cls: 'pill-green' },
+      { label: 'EBSI', cls: 'pill-purple' }
+    ],
+    warning: null
+  },
+  gov_digital: {
+    description: 'Digital government procedures, access to social benefits, unified citizen records, e-voting, and inter-agency communication without data silos.',
+    priorities: ['Interoperability', 'Adoption', 'Privacy'],
+    primary: [
+      { label: 'EBSI / eIDAS 2.0', cls: 'pill-purple' },
+      { label: 'W3C VC', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    secondary: [
+      { label: 'SD-JWT VC', cls: 'pill-green' },
+      { label: 'mDL ISO 18013-5', cls: 'pill-green' }
+    ],
+    warning: null
   }
 };
 
@@ -1927,51 +1564,40 @@ function renderPage3() {
   const d = SECTOR_DATA[sector];
   if (!d) return;
 
-  const layerColors = ['layer-l1','layer-l2','layer-l3','layer-l4'];
-  const layerNums = ['L1','L2','L3','L4'];
+  const priorityColour = {
+    'Privacy': '#5b34a0',
+    'Interoperability': '#c2185b',
+    'Adoption': '#1e6b45',
+    'Offline Use': '#1e3a6e'
+  };
 
   let html = '';
 
-  // Standards
-  html += '<h2>Recommended Standards</h2>';
-  html += '<div class="pills-row">' + d.standards.map(s => `<span class="pill ${s.cls}">${s.label}</span>`).join('') + '</div>';
+  html += `<p style="font-size:0.95rem;color:var(--ink2);line-height:1.7;margin-bottom:1.5rem;">${d.description}</p>`;
 
-  // Platforms
-  html += '<h2>Open-Source DPG Platforms</h2>';
-  html += '<div class="dpg-grid">' + d.platforms.map(p => `
-    <div class="dpg-card">
-      <div class="dpg-name">${p.name}</div>
-      <div class="dpg-desc">${p.desc}</div>
-    </div>`).join('') + '</div>';
+  html += '<h3 style="margin-bottom:0.6rem;">Credentialing Priorities</h3>';
+  html += '<div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-bottom:1.75rem;">';
+  d.priorities.forEach(p => {
+    const col = priorityColour[p] || 'var(--ink3)';
+    html += `<span style="display:inline-flex;align-items:center;padding:0.35rem 0.9rem;border-radius:3px;background:${col}18;border:1px solid ${col}55;font-size:0.78rem;font-weight:600;color:${col};letter-spacing:0.03em;text-transform:uppercase;">${p}</span>`;
+  });
+  html += '</div>';
 
-  // Rationale
-  html += '<div class="note" style="margin-bottom:1.25rem"><strong>Why these choices:</strong> ' + d.rationale + '</div>';
+  html += '<h3 style="margin-bottom:0.5rem;">Primary Standards</h3>';
+  html += '<div class="pills-row" style="margin-bottom:1.25rem;">' + d.primary.map(s => `<span class="pill ${s.cls}">${s.label}</span>`).join('') + '</div>';
 
-  // Warning
+  html += '<h3 style="margin-bottom:0.5rem;">Complementary</h3>';
+  html += '<div class="pills-row" style="margin-bottom:1.5rem;">' + d.secondary.map(s => `<span class="pill ${s.cls}">${s.label}</span>`).join('') + '</div>';
+
   if (d.warning) {
     html += '<div class="warn">' + d.warning + '</div>';
   }
-
-  // 4-layer stack
-  html += '<h2>The 4-Layer Architecture Stack</h2>';
-  html += '<div class="layer-stack">';
-  d.layers.forEach((l, i) => {
-    html += `<div class="layer ${layerColors[i]}">
-      <div class="layer-num">${l.num}</div>
-      <div class="layer-body">
-        <div class="layer-title">${l.label}</div>
-        <div class="layer-desc">${l.desc}</div>
-      </div>
-    </div>`;
-  });
-  html += '</div>';
 
   html += '<div class="divider"></div>';
 
   const p3Content = document.getElementById('p3Content');
   if (p3Content) p3Content.innerHTML = html;
 }
-
 // ══════════════════════════════════
 //  INIT — wire all events here
 // ══════════════════════════════════
@@ -1987,10 +1613,6 @@ document.getElementById('credSlider').addEventListener('input', updateEconomics)
 
 document.querySelectorAll('.spill[data-scenario]').forEach(el => {
   el.addEventListener('click', () => setScenario(el.dataset.scenario));
-});
-
-document.querySelectorAll('.toggle-item[data-tog]').forEach(el => {
-  el.addEventListener('click', () => toggleInfra(parseInt(el.dataset.tog)));
 });
 
 document.getElementById('extrapHeader').addEventListener('click', () => toggleCollapsible('extrapBody','extrapHeader'));
@@ -2024,9 +1646,16 @@ renderPage3();
 
 <footer id="site-footer">
   <div class="footer-inner">
-    <span class="footer-beta">Beta Version. Co-create with us!</span>
-    <span class="footer-sep">·</span>
-    <span class="footer-contact">Tanushka Vaid, Chief of Staff &nbsp;·&nbsp; <a href="mailto:tanushka@cdpi.dev">tanushka@cdpi.dev</a></span>
+    <div class="footer-left">
+      <div class="footer-cdpi">
+        By the <span style="font-weight:600;color:var(--ink2)">Centre for Digital Public Infrastructure</span><br>
+        <a href="https://www.cdpi.dev/" target="_blank" class="footer-website">www.cdpi.dev</a>
+      </div>
+    </div>
+    <div class="footer-right">
+      <div class="footer-beta">Beta Version. Co-create with us!</div>
+      <div class="footer-contact">Tanushka Vaid, Chief of Staff &nbsp;·&nbsp; <a href="mailto:tanushka@cdpi.dev">tanushka@cdpi.dev</a></div>
+    </div>
   </div>
 </footer>
 

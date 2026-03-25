@@ -15,24 +15,24 @@ Upload any identity document and the app instantly demonstrates how easily it ca
 An interactive cost calculator for KYC / Financial Services that compares traditional manual verification ($4–8 per check) against VC-based verification (near $0). Includes:
 
 - A population slider to model costs at national scale
+- Scenario toggles (Conservative / Base / Optimistic)
 - Unit economics broken down by actor: Infrastructure Holder, Issuer (Government), and Acceptor (Bank/Institution)
 - Citizen time burden comparison (hours lost to manual processes vs. instant digital verification)
-- Capacity and savings projections
+- Sector extrapolation for healthcare, education, and more
 
 ### Page 3 — How to Build
 
-Sector-specific implementation guidance covering 11 sectors (National ID, Education, Healthcare, Driver's Licence, and more). For each sector it recommends:
+Sector-specific implementation guidance covering 11 sectors (National ID, Education, Healthcare, Driver's Licence, and more). For each sector it shows:
 
-- **Standards** — W3C VC Data Model, ISO 18013-5 mDL, OID4VC
-- **Open-source DPG platforms** — INJI (MOSIP-aligned) and walt.id (enterprise SSI stack)
-- **4-Layer Architecture Stack** — Identifiers, Format, Transport, and Trust layers with sector-appropriate choices
+- **Credentialing priorities** — Privacy, Interoperability, Adoption, Offline Use
+- **Primary standards** — EBSI / eIDAS 2.0, mDL ISO 18013-5, OID4VC, W3C VC, AnonCreds (ZKP), SD-JWT VC
+- **Complementary standards** — additional standards relevant to the sector
+- Links to the CDPI Vision Paper and the VC Use-Cases deep-dive site
 
 ## Tech stack
 
 - Pure HTML / CSS / JavaScript — single `index.html` file, no build step
 - Fonts: Instrument Serif, DM Sans, JetBrains Mono (Google Fonts)
-- Uses `html-to-image` for screenshot capture
-- Designed to run inside a sandboxed iframe with a parent-app bridge (`window.claude`, `window.storage`, proxied `fetch`)
 
 ## Getting started
 
