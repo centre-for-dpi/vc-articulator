@@ -1,0 +1,2033 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verifiable Credentials — CDPI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=DM+Sans:wght@300;400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f5f4f1;
+  --ink: #111110;
+  --ink2: #2e2e2c;
+  --ink3: #767672;
+  --green: #0c3d2a;
+  --green-light: #1e6b45;
+  --amber: #b5621e;
+  --amber-bg: #faf2ea;
+  --amber-dark: #8f4a13;
+  --border: #ddddd8;
+  --red: #b91c1c;
+  --blue: #1e3a6e;
+  --teal: #1e5a6b;
+  --surface: #ffffff;
+  --font-head: 'Instrument Serif', 'Georgia', serif;
+  --font-body: 'DM Sans', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; scroll-behavior: smooth; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-body); min-height: 100vh; }
+
+/* ── HEADER ── */
+#header {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--surface);
+  border-bottom: 2px solid var(--border);
+  padding: 0 2.5rem;
+  display: flex; align-items: center; justify-content: space-between;
+  height: 68px;
+}
+.logo { display: flex; align-items: baseline; gap: 0.6rem; }
+.logo-main { font-family: var(--font-head); font-size: 1.2rem; font-weight: 400; color: var(--ink); letter-spacing: 0em; }
+.logo-by { font-family: var(--font-body); font-size: 0.72rem; font-weight: 600; color: var(--amber); letter-spacing: 0.08em; text-transform: uppercase; }
+nav { display: flex; gap: 0.4rem; }
+.nav-btn {
+  background: transparent;
+  border: 1.5px solid var(--border);
+  border-radius: 4px;
+  padding: 0.45rem 1rem;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--ink3);
+  text-align: center;
+  line-height: 1.45;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.nav-btn:hover { border-color: var(--ink2); color: var(--ink2); background: var(--bg); }
+.nav-btn.active { background: var(--ink); border-color: var(--ink); color: #fff; }
+
+/* ── PAGES ── */
+.sec { display: none; padding: 2.5rem 2rem 4rem; max-width: 1100px; margin: 0 auto; }
+.sec.on { display: block; }
+
+/* ── TYPOGRAPHY ── */
+.page-title { font-family: var(--font-head); font-size: 2rem; font-weight: 400; color: var(--ink); line-height: 1.2; margin-bottom: 0.4rem; }
+.page-sub { font-size: 0.95rem; color: var(--ink3); margin-bottom: 2rem; line-height: 1.6; font-weight: 400; }
+h2 { font-family: var(--font-head); font-size: 1.35rem; font-weight: 400; color: var(--ink); margin-bottom: 0.75rem; }
+h3 { font-family: var(--font-body); font-size: 0.72rem; font-weight: 700; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.09em; margin-bottom: 0.5rem; }
+
+/* ── CARDS & BOXES ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+.note {
+  background: var(--amber-bg);
+  border-left: 3px solid var(--amber);
+  border-radius: 3px;
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  color: var(--ink2);
+  margin-bottom: 1rem;
+  line-height: 1.6;
+}
+.warn {
+  background: #fdf8f0;
+  border-left: 3px solid #c8891e;
+  border-radius: 3px;
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  color: #6b3d0a;
+  margin-bottom: 1rem;
+  line-height: 1.6;
+}
+
+/* ── BUTTONS ── */
+.btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: var(--ink);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 0.7rem 1.5rem;
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-decoration: none;
+  letter-spacing: 0.01em;
+}
+.btn:hover { background: var(--ink2); transform: translateY(-1px); }
+.btn-outline {
+  background: transparent;
+  border: 1.5px solid var(--ink2);
+  color: var(--ink2);
+}
+.btn-outline:hover { background: var(--bg); transform: none; }
+.btn-sm { padding: 0.4rem 0.9rem; font-size: 0.78rem; }
+.btn-green { background: var(--green); }
+.btn-green:hover { background: #081f16; }
+.btn-amber { background: var(--amber); }
+.btn-amber:hover { background: var(--amber-dark); }
+
+/* ══════════════════════════════════
+   PAGE 1 — FORGERY DEMO
+══════════════════════════════════ */
+
+/* Upload zone */
+.upload-zone {
+  border: 1.5px dashed #c0bfba;
+  border-radius: 6px;
+  padding: 3rem 2rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  background: var(--surface);
+  margin-bottom: 1.5rem;
+}
+.upload-zone:hover, .upload-zone.drag-over {
+  border-color: var(--amber);
+  background: var(--amber-bg);
+}
+.upload-icon { font-size: 2rem; margin-bottom: 0.75rem; }
+.upload-label { font-size: 1rem; font-weight: 500; color: var(--ink2); margin-bottom: 0.25rem; }
+.upload-sub { font-size: 0.82rem; color: var(--ink3); }
+.upload-privacy { margin-top: 1rem; font-size: 0.78rem; color: var(--ink3); display: flex; align-items: center; justify-content: center; gap: 0.4rem; }
+#fileInput { display: none; }
+
+/* Forgery panels */
+.forgery-panels {
+  display: none;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+.forgery-panels.visible { display: grid; }
+.panel-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.panel-header {
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink3);
+  display: flex; align-items: center; gap: 0.5rem;
+  background: var(--bg);
+}
+.panel-header .dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot-green { background: #22c55e; }
+.dot-red { background: var(--red); }
+.panel-img { width: 100%; display: block; max-height: 340px; object-fit: contain; background: #f4f4f0; }
+#forgeryCanvas { width: 100%; display: block; max-height: 340px; background: #f4f4f0; }
+.panel-footer {
+  padding: 0.6rem 1rem;
+  font-size: 0.78rem;
+  color: var(--ink3);
+  background: #fafaf8;
+  border-top: 1px solid var(--border);
+}
+
+/* AI actions list */
+.ai-actions { padding: 0.75rem 1rem; font-size: 0.8rem; color: var(--ink2); }
+.ai-actions li { list-style: none; padding: 0.25rem 0; display: flex; align-items: center; gap: 0.5rem; }
+.ai-actions li::before { content: '▸'; color: var(--amber); font-size: 0.7rem; }
+
+/* Analysis section */
+.analysis-section { display: none; }
+.analysis-section.visible { display: block; }
+
+/* Difficulty bar */
+.diff-bar-wrap { margin-bottom: 1.5rem; }
+.diff-labels { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--ink3); font-family: var(--font-mono); margin-bottom: 0.4rem; }
+.diff-bar { height: 10px; border-radius: 99px; background: linear-gradient(to right, #22c55e, #eab308, #f97316, #dc2626); position: relative; }
+.diff-marker { position: absolute; top: -4px; width: 18px; height: 18px; background: var(--ink); border-radius: 50%; transform: translateX(-50%); border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3); transition: left 0.6s ease; }
+.diff-score-label { margin-top: 0.5rem; font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600; }
+
+/* Terminal */
+.terminal {
+  background: #0f1117;
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: #a3e635;
+  min-height: 120px;
+  overflow: auto;
+  margin-bottom: 1.5rem;
+  line-height: 1.7;
+}
+.terminal .t-line { opacity: 0; }
+.terminal .t-line.shown { opacity: 1; }
+.terminal .t-prompt { color: #6b7280; }
+.terminal .t-warn { color: #f97316; }
+
+/* VC advantage callout */
+.vc-advantage {
+  background: var(--green);
+  color: #fff;
+  border-radius: 6px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+  display: flex; align-items: flex-start; gap: 1rem;
+}
+.vc-adv-icon { font-size: 1.5rem; flex-shrink: 0; }
+.vc-adv-title { font-family: var(--font-head); font-size: 1rem; font-weight: 400; margin-bottom: 0.25rem; }
+.vc-adv-text { font-size: 0.85rem; opacity: 0.88; line-height: 1.65; }
+
+/* Loading state */
+.loading-overlay {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem;
+  flex-direction: column;
+  gap: 1rem;
+}
+.loading-overlay.visible { display: flex; }
+.spinner {
+  width: 36px; height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-text { font-size: 0.9rem; color: var(--ink3); }
+
+/* ══════════════════════════════════
+   PAGE 2 — ECONOMICS
+══════════════════════════════════ */
+
+.collapsible-header {
+  display: flex; align-items: center; justify-content: space-between;
+  cursor: pointer;
+  padding: 0.9rem 1.25rem;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: all 0.15s ease;
+}
+.collapsible-header:hover { border-color: var(--ink2); }
+.collapsible-header .chevron { transition: transform 0.25s ease; font-size: 0.75rem; }
+.collapsible-header.open .chevron { transform: rotate(180deg); }
+.collapsible-body { display: none; background: #fff; border: 1px solid var(--border); border-top: none; border-radius: 0 0 4px 4px; padding: 1.25rem; margin-bottom: 1.5rem; }
+.collapsible-body.open { display: block; }
+
+/* Country selector */
+.country-row {
+  display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap;
+}
+select, input[type=range] {
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+}
+select {
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.18s;
+}
+select:focus { border-color: var(--ink2); }
+.country-meta { font-size: 0.85rem; color: var(--ink3); }
+.country-meta strong { color: var(--ink2); }
+
+/* Economics cards */
+.econ-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+.econ-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.2rem;
+  text-align: center;
+}
+.econ-card .econ-val { font-family: var(--font-head); font-size: 1.9rem; font-weight: 400; color: var(--green); line-height: 1; margin: 0.5rem 0; }
+.econ-card .econ-label { font-size: 0.72rem; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; }
+.econ-card .econ-sub { font-size: 0.78rem; color: var(--ink3); margin-top: 0.25rem; }
+
+/* ROI hero */
+.roi-hero {
+  background: var(--green);
+  color: #fff;
+  border-radius: 6px;
+  padding: 2rem 2.5rem;
+  text-align: center;
+  margin-bottom: 1.5rem;
+}
+.roi-number { font-family: var(--font-head); font-size: 3.8rem; font-weight: 400; line-height: 1; }
+.roi-label { font-size: 0.95rem; opacity: 0.85; margin-top: 0.3rem; font-weight: 400; }
+.roi-sub { font-size: 0.8rem; opacity: 0.6; margin-top: 0.4rem; letter-spacing: 0.02em; }
+
+/* Scenario pills */
+.scenario-pills { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.spill {
+  padding: 0.3rem 0.85rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1.5px solid transparent;
+  transition: all 0.15s;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.spill.conservative { background: #f5e8e8; color: #7a1f1f; border-color: #e0c0c0; }
+.spill.base { background: #e8f0eb; color: #1a4a28; border-color: #b8d4c0; }
+.spill.optimistic { background: #e8ecf5; color: #1a2e5a; border-color: #b8c4e0; }
+.spill.active { border-color: currentColor; font-weight: 700; }
+
+/* Slider */
+.slider-wrap { margin-bottom: 1.5rem; }
+.slider-row { display: flex; align-items: center; gap: 1rem; }
+input[type=range] {
+  flex: 1; cursor: pointer;
+  accent-color: var(--amber);
+}
+.slider-val { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600; color: var(--ink2); min-width: 80px; }
+
+/* Toggle switches */
+.toggle-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-bottom: 1.5rem; }
+.toggle-item {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.toggle-item:hover { border-color: var(--ink3); }
+.toggle-label { font-size: 0.85rem; font-weight: 500; color: var(--ink2); }
+.toggle-switch {
+  width: 36px; height: 20px;
+  background: #c8c7c2;
+  border-radius: 99px;
+  position: relative;
+  transition: background 0.2s;
+}
+.toggle-switch::after {
+  content: '';
+  width: 14px; height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  position: absolute;
+  top: 3px; left: 3px;
+  transition: transform 0.2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+}
+.toggle-item.on .toggle-switch { background: var(--green); }
+.toggle-item.on .toggle-switch::after { transform: translateX(16px); }
+
+/* Actor rows */
+.actor-row {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 1rem;
+}
+.actor-header {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+.actor-left {
+  padding: 1rem 1.25rem;
+  border-left: 3px solid;
+}
+.actor-right {
+  padding: 1rem 1.25rem;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+}
+.actor-name { font-weight: 600; font-size: 0.9rem; color: var(--ink); margin-bottom: 0.2rem; }
+.actor-unit { font-family: var(--font-head); font-size: 1.5rem; color: var(--green); }
+.actor-unit-label { font-size: 0.72rem; color: var(--ink3); margin-bottom: 0.4rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.actor-scale { font-size: 0.83rem; color: var(--ink2); line-height: 1.6; }
+.actor-case { font-size: 0.75rem; color: var(--ink3); margin-top: 0.4rem; }
+.infra-color { border-color: #6d3ab5; }
+.issuer-color { border-color: var(--green); }
+.acceptor-color { border-color: var(--blue); }
+.notary-color { border-color: var(--amber); }
+
+/* Dept callout */
+.dept-callout {
+  background: #edf5f0;
+  border: 1px solid #b8d4c0;
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+.dept-callout .dc-title { font-weight: 700; font-size: 0.72rem; color: var(--green); text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 0.25rem; }
+
+/* Time callout */
+.time-callout {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+}
+.time-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-top: 0.75rem; }
+.time-cell { text-align: center; }
+.time-val { font-family: var(--font-head); font-size: 1.6rem; font-weight: 400; color: var(--ink); }
+.time-lbl { font-size: 0.72rem; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 0.1rem; }
+
+/* Capacity section */
+.cap-section { margin-bottom: 1.5rem; }
+.cap-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-top: 0.75rem; }
+.cap-cell { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; }
+.cap-val { font-family: var(--font-head); font-size: 1.4rem; font-weight: 400; color: var(--amber); }
+.cap-lbl { font-size: 0.78rem; color: var(--ink2); margin-top: 0.2rem; }
+
+/* Breakeven */
+.breakeven-bar {
+  height: 8px; border-radius: 3px;
+  background: linear-gradient(to right, #2d7a4f 0%, #c8891e 60%, #b91c1c 100%);
+  position: relative; margin: 0.75rem 0;
+}
+.be-marker {
+  position: absolute; top: -5px;
+  width: 18px; height: 18px;
+  background: var(--ink);
+  border: 2px solid #fff;
+  border-radius: 50%;
+  transform: translateX(-50%);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  transition: left 0.6s ease;
+}
+
+/* Sector extrapolation */
+.sector-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem; margin: 1rem 0; }
+.sector-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 0.9rem 1rem;
+  font-size: 0.85rem;
+}
+.sector-card .s-name { font-weight: 600; color: var(--ink); margin-bottom: 0.3rem; }
+.sector-card .s-val { font-family: var(--font-head); font-size: 1.1rem; color: var(--green); }
+.sector-card .s-label { font-size: 0.75rem; color: var(--ink3); }
+.coverage-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.coverage-row input[type=number] {
+  border: 1px solid var(--border); border-radius: 4px; padding: 0.45rem 0.75rem;
+  font-family: var(--font-mono); font-size: 0.9rem; width: 160px;
+  outline: none; transition: border-color 0.15s; background: var(--surface);
+}
+.coverage-row input:focus { border-color: var(--ink2); }
+
+/* ══════════════════════════════════
+   PAGE 3 — HOW TO BUILD
+══════════════════════════════════ */
+.sector-sel-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+.sector-sel-row label { font-weight: 600; font-size: 0.88rem; color: var(--ink2); }
+
+/* Standard pills */
+.pills-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0 1.25rem; }
+.pill {
+  padding: 0.28rem 0.8rem;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  border: 1px solid;
+  letter-spacing: 0.02em;
+}
+.pill-blue { background: #edf2fb; color: #1e3a6e; border-color: #b0c4e8; }
+.pill-green { background: #edf5f0; color: #0c3d2a; border-color: #a8d4b8; }
+.pill-amber { background: var(--amber-bg); color: var(--amber-dark); border-color: #d9b48a; }
+.pill-purple { background: #f2f0f8; color: #3d2080; border-color: #c0b0e8; }
+
+/* DPG platform cards */
+.dpg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 0.75rem 0 1.25rem; }
+.dpg-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1rem;
+  border-top: 2px solid var(--green);
+  transition: border-top-color 0.15s;
+}
+.dpg-card:hover { border-top-color: var(--green-light); }
+.dpg-name { font-weight: 600; font-size: 0.88rem; margin-bottom: 0.3rem; color: var(--ink); }
+.dpg-desc { font-size: 0.78rem; color: var(--ink3); line-height: 1.55; }
+
+/* 4-layer stack */
+.layer-stack { margin: 0.75rem 0 1.5rem; }
+.layer {
+  display: flex; align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 0.4rem;
+  background: var(--surface);
+}
+.layer-num {
+  width: 38px; flex-shrink: 0;
+  background: var(--ink);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  letter-spacing: 0.04em;
+}
+.layer-l1 .layer-num { background: #5b34a0; }
+.layer-l2 .layer-num { background: var(--blue); }
+.layer-l3 .layer-num { background: var(--green); }
+.layer-l4 .layer-num { background: var(--amber); }
+.layer-body { padding: 0.75rem 1rem; flex: 1; }
+.layer-title { font-weight: 600; font-size: 0.83rem; color: var(--ink); margin-bottom: 0.15rem; }
+.layer-desc { font-size: 0.78rem; color: var(--ink3); line-height: 1.5; }
+
+/* Tip component */
+.tip { position: relative; display: inline-flex; align-items: center; }
+.tip-icon {
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: var(--ink3);
+  color: #fff;
+  font-size: 0.6rem;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: help;
+  margin-left: 0.3rem;
+  flex-shrink: 0;
+}
+.tip-popup {
+  display: none;
+  position: absolute;
+  bottom: 120%; left: 50%;
+  transform: translateX(-50%);
+  background: var(--ink);
+  color: #fff;
+  font-size: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  white-space: nowrap;
+  z-index: 200;
+  pointer-events: none;
+  max-width: 240px;
+  white-space: normal;
+  line-height: 1.5;
+}
+.tip:hover .tip-popup { display: block; }
+
+/* CTA section */
+.cta-section { text-align: center; padding: 2.5rem; background: var(--green); border-radius: 6px; color: #fff; }
+.cta-title { font-family: var(--font-head); font-size: 1.7rem; font-weight: 400; margin-bottom: 0.5rem; }
+.cta-sub { font-size: 0.9rem; opacity: 0.75; margin-bottom: 1.5rem; font-weight: 400; }
+.cta-section .btn { background: #fff; color: var(--green); font-weight: 700; }
+.cta-section .btn:hover { background: var(--amber-bg); color: var(--green); transform: translateY(-1px); }
+
+.data-note { font-size: 0.75rem; color: var(--ink3); font-style: italic; margin-top: 0.5rem; }
+.divider { height: 1px; background: var(--border); margin: 2rem 0; }
+
+/* ── FOOTER ── */
+#site-footer {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  height: 96px;
+  display: flex; align-items: center; justify-content: center;
+}
+.footer-inner {
+  display: flex; align-items: center; gap: 0.75rem;
+  flex-wrap: wrap; justify-content: center;
+  font-size: 0.8rem; color: var(--ink3);
+}
+.footer-beta { font-weight: 600; color: var(--ink2); }
+.footer-sep { color: var(--border); }
+.footer-contact { color: var(--ink3); }
+.footer-contact a { color: var(--amber); text-decoration: none; }
+.footer-contact a:hover { text-decoration: underline; }
+
+@media (max-width: 700px) {
+  nav .nav-btn { font-size: 0.6rem; padding: 0.3rem 0.6rem; }
+  .logo-main { font-size: 1rem; }
+  .forgery-panels { grid-template-columns: 1fr; }
+  .actor-header { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- ══ HEADER ══ -->
+<header id="header">
+  <div class="logo">
+    <span class="logo-main">Verifiable Credentials</span>
+    <span class="logo-by">by CDPI</span>
+  </div>
+  <nav>
+    <button class="nav-btn active" id="nav0">WHY DO I<br>need VCs?</button>
+    <button class="nav-btn" id="nav1">HOW MUCH WILL<br>VCs cost?</button>
+    <button class="nav-btn" id="nav2">HOW DO I<br>build VCs?</button>
+  </nav>
+</header>
+
+<!-- ══════════════════════════════════
+     PAGE 1 — FORGERY DEMO
+══════════════════════════════════ -->
+<section class="sec on" id="sec0">
+  <div class="page-title">Can this document be forged?</div>
+  <div class="page-sub">Upload any identity document — we'll show you how easy forgery is, and why Verifiable Credentials eliminate the risk.</div>
+
+  <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+    <div class="upload-icon">📄</div>
+    <div class="upload-label">Drop an image here, or click to upload</div>
+    <div class="upload-sub">Supports JPG, PNG</div>
+    <div class="upload-privacy">🔒 Your file is processed once and never stored</div>
+  </div>
+  <input type="file" id="fileInput" accept=".jpg,.jpeg,.png">
+
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <div class="loading-text">AI is analysing document vulnerabilities…</div>
+  </div>
+
+  <!-- Two panels -->
+  <div class="forgery-panels" id="forgeryPanels">
+    <div class="panel-card">
+      <div class="panel-header"><span class="dot dot-green"></span> Original document</div>
+      <img id="originalImg" class="panel-img" src="" alt="Original document">
+      <div class="panel-footer">Authentic — as submitted</div>
+    </div>
+    <div class="panel-card">
+      <div class="panel-header"><span class="dot dot-red"></span> AI-processed copy — looks identical. That's the point.</div>
+      <canvas id="forgeryCanvas"></canvas>
+      <ul class="ai-actions" id="aiActionsList">
+        <li>Applied scan-line pattern</li>
+        <li>Replaced a data field with FORGED</li>
+        <li>Stripped metadata</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Analysis -->
+  <div class="analysis-section" id="analysisSection">
+    <div class="card">
+      <h2>Forgery analysis</h2>
+      <h3>Difficulty to forge</h3>
+      <div class="diff-bar-wrap">
+        <div class="diff-labels">
+          <span>TRIVIAL</span><span>EASY</span><span>MODERATE</span><span>HARD</span>
+        </div>
+        <div class="diff-bar">
+          <div class="diff-marker" id="diffMarker" style="left:20%"></div>
+        </div>
+        <div class="diff-score-label" id="diffLabel">Score: —</div>
+      </div>
+
+      <h3>How an attacker would do it</h3>
+      <div class="terminal" id="forgeryTerminal">
+        <span style="color:#6b7280">$ awaiting analysis…</span>
+      </div>
+
+      <div class="vc-advantage">
+        <div class="vc-adv-icon">🛡️</div>
+        <div>
+          <div class="vc-adv-title">Why Verifiable Credentials stop this</div>
+          <div class="vc-adv-text" id="vcAdvantageText">A VC is cryptographically signed — any tampering instantly invalidates the signature. No visual inspection needed. No forgery possible.</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin-top: 1rem;">
+      <button class="btn" id="ctaPage2">See the economics of VCs →</button>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════
+     PAGE 2 — ECONOMICS
+══════════════════════════════════ -->
+<section class="sec" id="sec1">
+  <div class="page-title">What do VCs cost — and save?</div>
+  <div class="page-sub">Full economics model for KYC / Financial Services — the most thoroughly documented sector.</div>
+
+  <!-- Sector note -->
+  <div class="note">📊 This model shows <strong>KYC / Financial Services</strong> — the most robustly documented sector. Figures are approximate; actual numbers may vary.</div>
+
+  <!-- Country selector -->
+  <div class="card">
+    <h3>Country &amp; Scale</h3>
+    <div class="country-row">
+      <select id="countrySelect"><option value="Afghanistan">Afghanistan (42M)</option><option value="Algeria">Algeria (46M)</option><option value="Angola">Angola (35M)</option><option value="Argentina">Argentina (46M)</option><option value="Australia">Australia (26M)</option><option value="Bangladesh">Bangladesh (170M)</option><option value="Bolivia">Bolivia (12M)</option><option value="Brazil">Brazil (216M)</option><option value="Burkina Faso">Burkina Faso (22M)</option><option value="Cambodia">Cambodia (17M)</option><option value="Cameroon">Cameroon (28M)</option><option value="Canada">Canada (38M)</option><option value="Chad">Chad (17M)</option><option value="Chile">Chile (20M)</option><option value="China">China (1425M)</option><option value="Colombia">Colombia (52M)</option><option value="Cuba">Cuba (11M)</option><option value="Dominican Republic">Dominican Republic (11M)</option><option value="Ecuador">Ecuador (18M)</option><option value="Egypt">Egypt (105M)</option><option value="El Salvador">El Salvador (6M)</option><option value="Ethiopia">Ethiopia (126M)</option><option value="France">France (68M)</option><option value="Germany">Germany (84M)</option><option value="Ghana">Ghana (34M)</option><option value="Greece">Greece (11M)</option><option value="Guatemala">Guatemala (18M)</option><option value="Haiti">Haiti (12M)</option><option value="Honduras">Honduras (10M)</option><option value="India">India (1428M)</option><option value="Indonesia">Indonesia (278M)</option><option value="Iraq">Iraq (42M)</option><option value="Italy">Italy (60M)</option><option value="Ivory Coast">Ivory Coast (28M)</option><option value="Japan">Japan (124M)</option><option value="Jordan">Jordan (10M)</option><option value="Kazakhstan">Kazakhstan (19M)</option><option value="Kenya">Kenya (56M)</option><option value="Lebanon">Lebanon (5M)</option><option value="Libya">Libya (7M)</option><option value="Madagascar">Madagascar (29M)</option><option value="Malaysia">Malaysia (33M)</option><option value="Mali">Mali (23M)</option><option value="Mexico">Mexico (129M)</option><option value="Morocco">Morocco (37M)</option><option value="Mozambique">Mozambique (33M)</option><option value="Myanmar">Myanmar (54M)</option><option value="Nepal">Nepal (30M)</option><option value="New Zealand">New Zealand (5M)</option><option value="Niger">Niger (26M)</option><option value="Nigeria">Nigeria (220M)</option><option value="Norway">Norway (5M)</option><option value="Pakistan">Pakistan (231M)</option><option value="Palestine">Palestine (5M)</option><option value="Peru">Peru (33M)</option><option value="Philippines">Philippines (115M)</option><option value="Poland">Poland (38M)</option><option value="Portugal">Portugal (10M)</option><option value="Rwanda">Rwanda (14M)</option><option value="Saudi Arabia">Saudi Arabia (36M)</option><option value="Senegal">Senegal (17M)</option><option value="Singapore">Singapore (6M)</option><option value="Somalia">Somalia (18M)</option><option value="South Africa">South Africa (60M)</option><option value="South Korea">South Korea (52M)</option><option value="Spain">Spain (47M)</option><option value="Sri Lanka">Sri Lanka (22M)</option><option value="Sudan">Sudan (45M)</option><option value="Sweden">Sweden (10M)</option><option value="Syria">Syria (22M)</option><option value="Tanzania">Tanzania (63M)</option><option value="Thailand">Thailand (70M)</option><option value="Tunisia">Tunisia (12M)</option><option value="Turkey">Turkey (85M)</option><option value="Uganda">Uganda (48M)</option><option value="Ukraine">Ukraine (44M)</option><option value="United Kingdom">United Kingdom (68M)</option><option value="United States">United States (335M)</option><option value="Uzbekistan">Uzbekistan (36M)</option><option value="Venezuela">Venezuela (28M)</option><option value="Vietnam">Vietnam (98M)</option><option value="Yemen">Yemen (34M)</option><option value="Zambia">Zambia (20M)</option><option value="Zimbabwe">Zimbabwe (16M)</option></select>
+      <span class="country-meta" id="countryMeta">India · population 1428M</span>
+    </div>
+    <h3 style="margin-top:0.75rem">Credentials in circulation</h3>
+    <div class="slider-wrap">
+      <div class="slider-row">
+        <input type="range" id="credSlider" min="0.5" max="2" step="0.1" value="1">
+        <span class="slider-val" id="credSliderVal">1428M</span>
+      </div>
+      <div class="data-note">Drag to set total credentials (0.5× to 2× population)</div>
+    </div>
+    <h3>Scenario</h3>
+    <div class="scenario-pills">
+      <span class="spill conservative" data-scenario="conservative">Conservative</span>
+      <span class="spill base active" data-scenario="base">Base</span>
+      <span class="spill optimistic" data-scenario="optimistic">Optimistic</span>
+    </div>
+    <h3>Digital Infrastructure Enabled</h3>
+    <div class="toggle-grid">
+      <div class="toggle-item on" id="tog0" data-tog="0">
+        <span class="toggle-label">Digital ID</span>
+        <div class="toggle-switch"></div>
+      </div>
+      <div class="toggle-item on" id="tog1" data-tog="1">
+        <span class="toggle-label">Shared KYC</span>
+        <div class="toggle-switch"></div>
+      </div>
+      <div class="toggle-item" id="tog2" data-tog="2">
+        <span class="toggle-label">Govt Wallet</span>
+        <div class="toggle-switch"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROI Hero -->
+  <div class="roi-hero">
+    <div class="roi-number" id="roiNumber">$9999.0</div>
+    <div class="roi-label">saved per $1 invested in VC infrastructure</div>
+    <div class="roi-sub" id="roiSub">Base scenario · India · 1428M credentials</div>
+  </div>
+
+  <div class="econ-grid">
+    <div class="econ-card">
+      <div class="econ-label">Manual KYC cost avoided</div>
+      <div class="econ-val" id="econManualCost">$25.7B</div>
+      <div class="econ-sub">at $6/check (mid-point of $4–8 range, MicroSave 2023)</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">VC verification cost</div>
+      <div class="econ-val" style="color:var(--green)">$0</div>
+      <div class="econ-sub">VCs verify offline, cryptographically — no per-check fee</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Infra investment</div>
+      <div class="econ-val" id="econInfra" style="color:var(--ink3)">$750K</div>
+      <div class="econ-sub">one-time setup (T&amp;T · Brazil rollout data)</div>
+    </div>
+  </div>
+
+  <!-- Actor rows -->
+  <h2 style="margin-bottom:1rem">Unit economics by actor</h2>
+
+  <div class="actor-row">
+    <div class="actor-header">
+      <div class="actor-left infra-color">
+        <div class="actor-name">Infrastructure Holder</div>
+        <div class="actor-unit-label">One-time setup</div>
+        <div class="actor-unit" id="actInfra">$750K</div>
+        <div class="actor-unit-label" style="margin-top:0.3rem">+ ~$50K/yr maintenance*</div>
+      </div>
+      <div class="actor-right">
+        <div class="actor-scale">Shared across all issuers and acceptors. T&amp;T paid $500K; Brazil $750K. Cost per credential approaches zero at scale.</div>
+        <div class="actor-case">📍 T&amp;T rollout · Brazil rollout (CDPI)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="dept-callout">
+    <div class="dc-title">Issuing Dept (Government) Economics</div>
+    <div style="font-size:0.875rem;color:var(--ink2)">Digital issuance reuses existing identity infrastructure. Estimated digital cost $0.01–0.05/credential* vs $2–5* for physical production and distribution.</div>
+  </div>
+
+  <div class="actor-row">
+    <div class="actor-header">
+      <div class="actor-left issuer-color">
+        <div class="actor-name">Issuer (Govt Dept)</div>
+        <div class="actor-unit-label">Auth fee (UIDAI model)</div>
+        <div class="actor-unit">₹5 / auth</div>
+        <div class="actor-unit-label" style="margin-top:0.3rem">~$0.059 per authentication</div>
+      </div>
+      <div class="actor-right">
+        <div class="actor-scale">UIDAI processed 2,707 crore authentications in FY2024-25 at ₹5 each. Digital issuance cost per credential estimated at $0.01–0.05*.</div>
+        <div class="actor-case">📍 UIDAI FY2024-25 Annual Report</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="actor-row">
+    <div class="actor-header">
+      <div class="actor-left acceptor-color">
+        <div class="actor-name">Acceptor (Bank / Institution)</div>
+        <div class="actor-unit-label">Cost per verification</div>
+        <div class="actor-unit" id="actAcceptor">$0.06</div>
+        <div class="actor-unit-label" style="margin-top:0.3rem">vs $4–8 manual KYC</div>
+      </div>
+      <div class="actor-right">
+        <div class="actor-scale">Instant cryptographic check replaces 3–5 day manual review. Manual KYC costs $4–8/check; VC fee range $0.06–0.75/check.</div>
+        <div class="actor-case">📍 MicroSave 2023 · UIDAI fee schedule</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Time burden -->
+  <div class="time-callout">
+    <h3>Citizen Time Burden*</h3>
+    <div class="time-grid">
+      <div class="time-cell">
+        <div class="time-val">6 hrs<sup style="font-size:0.5em;vertical-align:super">*</sup></div>
+        <div class="time-lbl">Getting the doc<br>(manual)</div>
+      </div>
+      <div class="time-cell">
+        <div class="time-val">3 hrs<sup style="font-size:0.5em;vertical-align:super">*</sup></div>
+        <div class="time-lbl">Re-presenting<br>(per verification)</div>
+      </div>
+      <div class="time-cell">
+        <div class="time-val">3×/yr<sup style="font-size:0.5em;vertical-align:super">*</sup></div>
+        <div class="time-lbl">Average re-present<br>frequency</div>
+      </div>
+      <div class="time-cell">
+        <div class="time-val" id="timeSavedVal" style="color:var(--green)">15 hrs/yr</div>
+        <div class="time-lbl">Total time saved<br>per citizen</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Capacity unlock -->
+  <div class="cap-section card">
+    <h3>Capacity unlocked*</h3>
+    <div class="cap-grid">
+      <div class="cap-cell">
+        <div class="cap-val" id="capOfficers">1.1B</div>
+        <div class="cap-lbl">Officer hours freed/yr*</div>
+      </div>
+      <div class="cap-cell">
+        <div class="cap-val" id="capCitizens">21.4B</div>
+        <div class="cap-lbl">Citizen hours freed/yr*</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="data-note" style="margin-top:-0.5rem;margin-bottom:0.5rem">📚 Sourced figures: UIDAI FY2024-25 Annual Report · MicroSave 2023 · CDPI rollout data (T&amp;T, Brazil)</div>
+  <div class="data-note" style="margin-bottom:1.5rem">* Estimated figures based on typical government service delivery benchmarks.</div>
+
+  <!-- Sector extrapolation (collapsible) -->
+  <div class="collapsible-header" id="extrapHeader" style="background:#1e6b72;border-color:#1e6b72;color:#fff;">
+    <span>📐 Extrapolate to my sector →</span>
+    <span class="chevron" style="color:#fff;">▼</span>
+  </div>
+  <div class="collapsible-body" id="extrapBody">
+    <div class="coverage-row">
+      <label style="font-weight:600;font-size:0.9rem">Sector:</label>
+      <select id="sectorSelect2"><option value="national_id">National ID</option><option value="education">Education</option><option value="drivers_licence">Driver's Licence</option><option value="sme_identity">SME Identity</option><option value="healthcare">Healthcare</option><option value="professional">Professional Licences</option><option value="age_verification">Age Verification</option><option value="supply_chain">Supply Chain</option><option value="tourism">Tourism / Travel</option><option value="agriculture">Agriculture / ESG</option><option value="gov_digital">Gov Digital Services</option></select>
+      <label style="font-weight:600;font-size:0.9rem">Coverage:</label>
+      <input type="number" id="coverageInput" value="100000000" placeholder="People covered">
+    </div>
+    <div class="econ-grid" id="sectorExtrapCards">
+    <div class="econ-card">
+      <div class="econ-label">Getting the doc (manual)</div>
+      <div class="econ-val" style="font-size:1.4rem">$2.4B</div>
+      <div class="econ-sub">6 hrs × 100.0M people</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Paper/physical cost</div>
+      <div class="econ-val" style="font-size:1.4rem">$250M</div>
+      <div class="econ-sub">~$2.50 per credential</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Annual re-presenting cost</div>
+      <div class="econ-val" style="font-size:1.4rem">$1.0B</div>
+      <div class="econ-sub">2×/yr × $5/check</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Net annual saving with VCs</div>
+      <div class="econ-val" style="color:var(--green);font-size:1.4rem">$990M</div>
+      <div class="econ-sub">vs $0.05/VC check</div>
+    </div>
+  </div>
+    <div class="note" id="sectorBenefit" style="margin-top:0.5rem">💡 <strong>National ID:</strong> Eliminates document fraud at national scale. Enables instant e-services for all citizens. Reduces identity theft dramatically.</div>
+  </div>
+
+  <div class="divider"></div>
+  <div style="text-align:center">
+    <button class="btn" id="ctaPage3">See how to build VCs →</button>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════
+     PAGE 3 — HOW TO BUILD
+══════════════════════════════════ -->
+<section class="sec" id="sec2">
+  <div class="page-title">How do I build VCs?</div>
+  <div class="page-sub">Standards, platforms and architecture — tailored to your sector.</div>
+
+  <div class="sector-sel-row">
+    <label>Select sector:</label>
+    <select id="sectorSelect3"><option value="national_id">National ID</option><option value="education">Education</option><option value="drivers_licence">Driver's Licence</option><option value="sme_identity">SME Identity</option><option value="healthcare">Healthcare</option><option value="professional">Professional Licences</option><option value="age_verification">Age Verification</option><option value="supply_chain">Supply Chain</option><option value="tourism">Tourism / Travel</option><option value="agriculture">Agriculture / ESG</option><option value="gov_digital">Gov Digital Services</option></select>
+  </div>
+
+  <div id="p3Content"><h2>Recommended Standards</h2><div class="pills-row"><span class="pill pill-blue">W3C VC Data Model</span><span class="pill pill-green">ISO 18013-5 mDL</span><span class="pill pill-amber">OID4VC</span></div><h2>Open-Source DPG Platforms</h2><div class="dpg-grid">
+    <div class="dpg-card">
+      <div class="dpg-name">INJI</div>
+      <div class="dpg-desc">MOSIP-aligned wallet and issuance platform. Proven at national scale in multiple countries.</div>
+    </div>
+    <div class="dpg-card">
+      <div class="dpg-name">walt.id</div>
+      <div class="dpg-desc">Enterprise-grade SSI stack. Full W3C VC + OID4VC support with REST APIs.</div>
+    </div></div><div class="note" style="margin-bottom:1.25rem"><strong>Why these choices:</strong> National ID requires both physical (mDL) and digital (W3C VC) formats. OID4VC ensures wallet interoperability. INJI provides a proven national-scale deployment path; walt.id suits custom enterprise integration.</div><h2>The 4-Layer Architecture Stack</h2><div class="layer-stack"><div class="layer layer-l1">
+      <div class="layer-num">L1</div>
+      <div class="layer-body">
+        <div class="layer-title">Identifiers</div>
+        <div class="layer-desc">DID:web or DID:jwk for government issuers. Linked to existing National ID registry.</div>
+      </div>
+    </div><div class="layer layer-l2">
+      <div class="layer-num">L2</div>
+      <div class="layer-body">
+        <div class="layer-title">Format</div>
+        <div class="layer-desc">W3C VC JSON-LD for digital presentation + ISO mDL for physical/mobile driver use.</div>
+      </div>
+    </div><div class="layer layer-l3">
+      <div class="layer-num">L3</div>
+      <div class="layer-body">
+        <div class="layer-title">Transport</div>
+        <div class="layer-desc">OID4VCI for issuance, OID4VP for presentation. Works across wallets.</div>
+      </div>
+    </div><div class="layer layer-l4">
+      <div class="layer-num">L4</div>
+      <div class="layer-body">
+        <div class="layer-title">Trust</div>
+        <div class="layer-desc">Government-run Trust Registry. Anchored to national PKI infrastructure.</div>
+      </div>
+    </div></div><div class="divider"></div></div>
+
+  <div class="cta-section">
+    <div class="cta-title">Ready to deploy Verifiable Credentials?</div>
+    <div class="cta-sub">CDPI provides pro bono advisory to governments.</div>
+    <a class="btn" href="mailto:info@cdpi.dev">Contact CDPI for advisory →</a>
+    <div style="margin-top:1.25rem;font-size:0.8rem;opacity:0.7">
+      Source: <a href="https://vc-use-cases.cdpi.dev/vc-cheatsheet.html" target="_blank" style="color:#a3e635;text-underline-offset:3px">CDPI VC Cheatsheet</a>
+    </div>
+  </div>
+</section>
+
+<script>
+// ══════════════════════════════════
+//  PAGE NAVIGATION
+// ══════════════════════════════════
+function go(i) {
+  document.querySelectorAll('.sec').forEach((s,idx) => {
+    s.classList.toggle('on', idx === i);
+  });
+  document.querySelectorAll('.nav-btn').forEach((b,idx) => {
+    b.classList.toggle('active', idx === i);
+  });
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ══════════════════════════════════
+//  PAGE 1 — FORGERY DEMO
+// ══════════════════════════════════
+const uploadZone = document.getElementById('uploadZone');
+const fileInput = document.getElementById('fileInput');
+
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) processFile(file);
+});
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) processFile(e.target.files[0]);
+});
+
+async function processFile(file) {
+  if (!file.type.match(/image\/(png|jpeg)/)) {
+    alert('Please upload a JPG or PNG image.');
+    return;
+  }
+
+  uploadZone.style.display = 'none';
+  document.getElementById('loadingOverlay').classList.add('visible');
+  document.getElementById('forgeryPanels').classList.remove('visible');
+  document.getElementById('analysisSection').classList.remove('visible');
+
+  // Convert to base64
+  const base64 = await fileToBase64(file);
+
+  // Show original image
+  const originalImg = document.getElementById('originalImg');
+  originalImg.src = 'data:' + file.type + ';base64,' + base64;
+
+  let analysisData = null;
+  try {
+    analysisData = await callClaudeForForgery(base64, file.type);
+  } catch(err) {
+    console.error('Claude API error:', err);
+    // Fallback demo data
+    analysisData = {
+      documentType: 'Identity Document',
+      forgeryDifficultyScore: 2,
+      estimatedReplicationTime: '~30 minutes',
+      vulnerabilities: ['No digital signature', 'Standard font easily replicated', 'No hologram verification'],
+      analysis: 'This document relies solely on visual inspection. Modern inkjet printers and image editors make replication trivial.',
+      vcAdvantage: 'A cryptographically signed Verifiable Credential would make any tampering instantly detectable — no visual inspection required.',
+      forgerSteps: [
+        { field: 'Date of Birth', change: 'Alter to reduce age', tool: 'Adobe Photoshop', font: 'Arial', time: '5 min' },
+        { field: 'Name field', change: 'Replace with target name', tool: 'GIMP', font: 'Helvetica', time: '10 min' },
+        { field: 'ID Number', change: 'Generate valid-looking number', tool: 'Any text editor', font: 'Courier', time: '3 min' }
+      ],
+      forgeryEdit: { found: true, x: 0.35, y: 0.42, w: 0.3, h: 0.08, bgR: 245, bgG: 242, bgB: 235 }
+    };
+  }
+
+  document.getElementById('loadingOverlay').classList.remove('visible');
+
+  drawForgery(originalImg.src, analysisData.forgeryEdit);
+
+  document.getElementById('forgeryPanels').classList.add('visible');
+
+  // Populate analysis
+  populateAnalysis(analysisData);
+  document.getElementById('analysisSection').classList.add('visible');
+}
+
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(',')[1]);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+
+async function callClaudeForForgery(base64, mimeType) {
+  const isImage = mimeType.startsWith('image/');
+  const contentParts = isImage
+    ? [
+        { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+        { type: 'text', text: `Analyse this identity document image for forgery vulnerability. Return ONLY a valid JSON object (no markdown, no extra text) with exactly these fields:
+{
+  "documentType": string,
+  "forgeryDifficultyScore": number 1-4 (1=trivial,2=easy,3=moderate,4=hard),
+  "estimatedReplicationTime": string,
+  "vulnerabilities": [string, string, string],
+  "analysis": string (2 sentences),
+  "vcAdvantage": string (2 sentences on how VCs fix this),
+  "forgerSteps": [
+    {"field": string, "change": string, "tool": string, "font": string, "time": string},
+    {"field": string, "change": string, "tool": string, "font": string, "time": string},
+    {"field": string, "change": string, "tool": string, "font": string, "time": string}
+  ],
+  "forgeryEdit": {
+    "found": true,
+    "field": string (name of the field being forged, e.g. "Date of Birth", "Name", "ID Number"),
+    "x": number (0-1 fraction — left edge of the TEXT ONLY, not the full line width),
+    "y": number (0-1 fraction — top edge of the text line, cropped tightly to just that single line),
+    "w": number (0-1 fraction — width spanning just the text content of that field, typically 0.15-0.35),
+    "h": number (0-1 fraction — height of a single text line, typically 0.03-0.06),
+    "bgR": number (0-255, RED of the background colour sampled from blank whitespace immediately beside the target text — NOT from the text glyphs themselves),
+    "bgG": number (0-255, GREEN sampled same way),
+    "bgB": number (0-255, BLUE sampled same way)
+  }
+}
+IMPORTANT for forgeryEdit: pick ONE short text field (DOB, name, or ID number). The bounding box must be a tight single-line rectangle around just that text — not the whole card width. x+w should not exceed the right edge of the text. h should be just the cap-height of the text line.` }
+      ]
+    : [{ type: 'text', text: 'The uploaded file is a PDF identity document. Provide a realistic forgery analysis as JSON.' }];
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1200,
+      messages: [{ role: 'user', content: contentParts }]
+    })
+  });
+  const data = await resp.json();
+  const text = data.content?.map(c => c.text || '').join('') || '';
+  const clean = text.replace(/```json|```/g,'').trim();
+  return JSON.parse(clean);
+}
+
+function drawForgery(src, edit) {
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.getElementById('forgeryCanvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    if (edit && edit.found) {
+      const x = Math.round(edit.x * canvas.width);
+      const y = Math.round(edit.y * canvas.height);
+      const w = Math.round(edit.w * canvas.width);
+      const h = Math.round(edit.h * canvas.height);
+
+      // Sample background colour from a slightly expanded area around the box
+      // but avoid the center (where text is). Sample left strip + right strip + top + bottom.
+      const pad = Math.max(4, Math.round(h * 0.5));
+      let r = 0, g = 0, b = 0, count = 0;
+
+      const sampleRegions = [
+        // strip above
+        { sx: x, sy: Math.max(0, y - pad), sw: w, sh: Math.min(pad, y) },
+        // strip below
+        { sx: x, sy: Math.min(canvas.height - 1, y + h), sw: w, sh: Math.min(pad, canvas.height - y - h) },
+        // strip left (if there's space)
+        { sx: Math.max(0, x - pad), sy: y, sw: Math.min(pad, x), sh: h },
+        // strip right
+        { sx: Math.min(canvas.width - 1, x + w), sy: y, sw: Math.min(pad, canvas.width - x - w), sh: h },
+      ];
+
+      for (const { sx, sy, sw, sh } of sampleRegions) {
+        if (sw <= 0 || sh <= 0) continue;
+        try {
+          const d = ctx.getImageData(sx, sy, sw, sh).data;
+          for (let i = 0; i < d.length; i += 4) {
+            // Skip near-black pixels (likely text/borders)
+            if (d[i] < 30 && d[i+1] < 30 && d[i+2] < 30) continue;
+            r += d[i]; g += d[i+1]; b += d[i+2]; count++;
+          }
+        } catch(e) { /* cross-origin tainted */ }
+      }
+
+      // Fallback: use Claude's suggested colour
+      const bgR = count > 0 ? Math.round(r / count) : (edit.bgR || 245);
+      const bgG = count > 0 ? Math.round(g / count) : (edit.bgG || 242);
+      const bgB = count > 0 ? Math.round(b / count) : (edit.bgB || 235);
+
+      // Fill rectangle
+      ctx.fillStyle = `rgb(${bgR},${bgG},${bgB})`;
+      ctx.fillRect(x, y, w, h);
+
+      // Size font to fit snugly: start at 60% of box height, then shrink to fit width
+      let fontSize = Math.max(9, Math.round(h * 0.62));
+      ctx.font = `bold ${fontSize}px "JetBrains Mono", monospace`;
+      // Shrink font until text fits within 90% of box width
+      while (ctx.measureText('FORGED').width > w * 0.9 && fontSize > 8) {
+        fontSize--;
+        ctx.font = `bold ${fontSize}px "JetBrains Mono", monospace`;
+      }
+
+      ctx.fillStyle = '#111110';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('FORGED', x + w / 2, y + h / 2);
+    }
+
+    // Scan lines on top
+    drawScanlines(ctx, canvas.width, canvas.height);
+  };
+  img.src = src;
+}
+
+function drawScanlines(ctx, w, h) {
+  ctx.fillStyle = 'rgba(0,0,0,0.04)';
+  for (let y = 0; y < h; y += 4) {
+    ctx.fillRect(0, y, w, 1);
+  }
+}
+
+function populateAnalysis(d) {
+  // Difficulty
+  const score = d.forgeryDifficultyScore || 2;
+  const pct = ((score - 1) / 3) * 90 + 5;
+  const marker = document.getElementById('diffMarker');
+  if (marker) marker.style.left = pct + '%';
+  const labels = ['', 'TRIVIAL', 'EASY', 'MODERATE', 'HARD'];
+  const lbl = document.getElementById('diffLabel');
+  if (lbl) lbl.textContent = `Score: ${score}/4 — ${labels[score]} · ${d.estimatedReplicationTime || ''}`;
+
+  // Terminal
+  const term = document.getElementById('forgeryTerminal');
+  if (term) {
+    const steps = d.forgerSteps || [];
+    let html = `<div class="t-line shown"><span class="t-prompt">$ forgery-sim --target "${d.documentType}"</span></div>`;
+    steps.forEach((s, i) => {
+      html += `<div class="t-line" id="tl${i}" style="transition-delay:${(i+1)*0.4}s">`;
+      html += `<span class="t-warn">[${i+1}]</span> Field: <strong>${s.field}</strong> → ${s.change}`;
+      html += ` <span style="color:#6b7280">| ${s.tool} | ${s.font} | ${s.time}</span></div>`;
+    });
+    html += `<div class="t-line" id="tlDone" style="transition-delay:${(steps.length+1)*0.4}s"><span style="color:#a3e635">✓ Forgery complete. Visual inspection: PASSED.</span></div>`;
+    term.innerHTML = html;
+    // Animate lines in
+    requestAnimationFrame(() => {
+      term.querySelectorAll('.t-line').forEach((el, i) => {
+        setTimeout(() => el.classList.add('shown'), i * 420);
+      });
+    });
+  }
+
+  // VC advantage
+  const vcAdv = document.getElementById('vcAdvantageText');
+  if (vcAdv) vcAdv.textContent = d.vcAdvantage || '';
+}
+
+// ══════════════════════════════════
+//  PAGE 2 — ECONOMICS
+// ══════════════════════════════════
+const COUNTRIES = [
+  {name:'India',pop:1428},{name:'China',pop:1425},{name:'United States',pop:335},
+  {name:'Indonesia',pop:278},{name:'Pakistan',pop:231},{name:'Brazil',pop:216},
+  {name:'Nigeria',pop:220},{name:'Bangladesh',pop:170},{name:'Ethiopia',pop:126},
+  {name:'Mexico',pop:129},{name:'Philippines',pop:115},{name:'Egypt',pop:105},
+  {name:'Tanzania',pop:63},{name:'Kenya',pop:56},{name:'South Africa',pop:60},
+  {name:'Colombia',pop:52},{name:'Myanmar',pop:54},{name:'Ghana',pop:34},
+  {name:'Morocco',pop:37},{name:'Mozambique',pop:33},{name:'Peru',pop:33},
+  {name:'Angola',pop:35},{name:'Algeria',pop:46},{name:'Sudan',pop:45},
+  {name:'Uganda',pop:48},{name:'Iraq',pop:42},{name:'Ukraine',pop:44},
+  {name:'Argentina',pop:46},{name:'Malaysia',pop:33},{name:'Thailand',pop:70},
+  {name:'Vietnam',pop:98},{name:'Saudi Arabia',pop:36},{name:'Turkey',pop:85},
+  {name:'Germany',pop:84},{name:'France',pop:68},{name:'United Kingdom',pop:68},
+  {name:'Italy',pop:60},{name:'Spain',pop:47},{name:'Poland',pop:38},
+  {name:'Canada',pop:38},{name:'Australia',pop:26},{name:'South Korea',pop:52},
+  {name:'Japan',pop:124},{name:'Kazakhstan',pop:19},{name:'Uzbekistan',pop:36},
+  {name:'Rwanda',pop:14},{name:'Bolivia',pop:12},{name:'Ecuador',pop:18},
+  {name:'Venezuela',pop:28},{name:'Chile',pop:20},{name:'Sri Lanka',pop:22},
+  {name:'Nepal',pop:30},{name:'Cambodia',pop:17},{name:'Zimbabwe',pop:16},
+  {name:'Zambia',pop:20},{name:'Senegal',pop:17},{name:'Cameroon',pop:28},
+  {name:'Ivory Coast',pop:28},{name:'Burkina Faso',pop:22},{name:'Mali',pop:23},
+  {name:'Niger',pop:26},{name:'Chad',pop:17},{name:'Madagascar',pop:29},
+  {name:'Guatemala',pop:18},{name:'Honduras',pop:10},{name:'El Salvador',pop:6},
+  {name:'Haiti',pop:12},{name:'Dominican Republic',pop:11},{name:'Cuba',pop:11},
+  {name:'Jordan',pop:10},{name:'Lebanon',pop:5},{name:'Tunisia',pop:12},
+  {name:'Libya',pop:7},{name:'Somalia',pop:18},{name:'Afghanistan',pop:42},
+  {name:'Yemen',pop:34},{name:'Syria',pop:22},{name:'Palestine',pop:5},
+  {name:'New Zealand',pop:5},{name:'Singapore',pop:6},{name:'Portugal',pop:10},
+  {name:'Greece',pop:11},{name:'Sweden',pop:10},{name:'Norway',pop:5}
+];
+
+const scenarioMultipliers = { conservative: 2, base: 3, optimistic: 4 };
+let currentScenario = 'base';
+let infraToggles = [true, true, false];
+
+function avgSalary(pop) {
+  if (pop < 10) return 18000;
+  if (pop < 50) return 12000;
+  if (pop < 200) return 8000;
+  return 6000;
+}
+
+function infraCost(pop) {
+  if (pop < 10) return 300000;
+  if (pop < 50) return 500000;
+  return 750000;
+}
+
+function formatBig(n) {
+  if (n >= 1e12) return '$' + (n/1e12).toFixed(1) + 'T';
+  if (n >= 1e9) return '$' + (n/1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return '$' + (n/1e6).toFixed(0) + 'M';
+  if (n >= 1e3) return '$' + (n/1e3).toFixed(0) + 'K';
+  return '$' + n.toFixed(0);
+}
+
+function setEl(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+// Populate country dropdown
+(function() {
+  const sel = document.getElementById('countrySelect');
+  const sorted = [...COUNTRIES].sort((a,b) => a.name.localeCompare(b.name));
+  sorted.forEach(c => {
+    const o = document.createElement('option');
+    o.value = c.name;
+    o.textContent = c.name + ' (' + c.pop + 'M)';
+    sel.appendChild(o);
+  });
+  sel.value = 'India';
+})();
+
+function getCountryData() {
+  const sel = document.getElementById('countrySelect');
+  const name = sel?.value || 'India';
+  const found = COUNTRIES.find(c => c.name === name) || { name: 'India', pop: 1428 };
+  return found;
+}
+
+function updateEconomics() {
+  const country = getCountryData();
+  const pop = country.pop;
+  const mult = scenarioMultipliers[currentScenario];
+  const sliderRaw = parseFloat(document.getElementById('credSlider')?.value || 1);
+  const stock = Math.round(pop * sliderRaw * 1e6);
+  const annualIssued = stock / 5;
+  const verVol = stock * mult;
+
+  setEl('credSliderVal', Math.round(stock/1e6) + 'M');
+
+  const salary = avgSalary(pop);
+  const infra = infraCost(pop);
+  const manualCostPerCheck = 6; // mid of $4-8
+  const vcFeePerCheck = 0.06;
+
+  const manualCostTotal = verVol * manualCostPerCheck;
+  const vcCostTotal = verVol * vcFeePerCheck;
+  const netSave = manualCostTotal - vcCostTotal;
+  const roi = netSave / infra;
+
+  setEl('countryMeta', country.name + ' · population ' + pop.toFixed(0) + 'M');
+  setEl('econManualCost', formatBig(manualCostTotal));
+  setEl('econInfra', formatBig(infra));
+  setEl('actInfra', formatBig(infra));
+  setEl('actAcceptor', '$0.06');
+  setEl('roiNumber', '$' + Math.min(roi, 9999).toFixed(1));
+  setEl('roiSub', currentScenario.charAt(0).toUpperCase() + currentScenario.slice(1) + ' scenario · ' + country.name + ' · ' + Math.round(stock/1e6) + 'M credentials');
+
+  // Time savings
+  const timeSavedPerCitizen = 6 + (3 * 3); // 6 hrs getting + 9 hrs re-presenting
+  setEl('timeSavedVal', timeSavedPerCitizen + ' hrs/yr');
+
+  // Capacity
+  const officerHrs = verVol * 0.25; // 15 min each
+  const citizenHrs = stock * timeSavedPerCitizen;
+  setEl('capOfficers', formatBig(officerHrs).replace('$',''));
+  setEl('capCitizens', formatBig(citizenHrs).replace('$',''));
+}
+
+function setScenario(s) {
+  currentScenario = s;
+  document.querySelectorAll('.spill').forEach(el => {
+    el.classList.toggle('active', el.classList.contains(s));
+  });
+  updateEconomics();
+}
+
+function toggleInfra(i) {
+  infraToggles[i] = !infraToggles[i];
+  const el = document.getElementById('tog' + i);
+  if (el) el.classList.toggle('on', infraToggles[i]);
+  updateEconomics();
+}
+
+function toggleCollapsible(bodyId, headerId) {
+  const body = document.getElementById(bodyId);
+  const header = document.getElementById(headerId);
+  if (!body || !header) return;
+  const isOpen = body.classList.toggle('open');
+  header.classList.toggle('open', isOpen);
+}
+
+// Sector extrapolation
+const SECTOR_PARAMS = {
+  national_id: { label: 'National ID', manualCost: 5, vcCost: 0.05, freq: 2, benefit: 'Eliminates document fraud at national scale. Enables instant e-services for all citizens. Reduces identity theft dramatically.' },
+  education: { label: 'Education', manualCost: 8, vcCost: 0.10, freq: 1, benefit: 'Permanent verifiable transcripts recognised globally. Eliminates degree fraud. Saves institutions significant verification overhead.' },
+  drivers_licence: { label: "Driver's Licence", manualCost: 4, vcCost: 0.06, freq: 3, benefit: 'Instant roadside checks. Cross-border recognition. Eliminates licence forgery which contributes to road fatalities.' },
+  sme_identity: { label: 'SME Identity', manualCost: 15, vcCost: 0.50, freq: 2, benefit: 'Enables SMEs to access finance faster. Reduces cost of business registration. Opens export markets requiring identity proofs.' },
+  healthcare: { label: 'Healthcare', manualCost: 12, vcCost: 0.20, freq: 4, benefit: 'Prevents prescription fraud. Enables portable patient records. Reduces duplicate testing. Improves emergency care outcomes.' },
+  professional: { label: 'Professional Licences', manualCost: 20, vcCost: 0.50, freq: 1, benefit: 'Instant licence verification for employers. Eliminates fake professionals. Enables cross-border labour mobility.' },
+  age_verification: { label: 'Age Verification', manualCost: 2, vcCost: 0.03, freq: 10, benefit: 'Privacy-preserving age checks online without revealing full identity. Reduces under-age access to restricted content and products.' },
+  supply_chain: { label: 'Supply Chain', manualCost: 25, vcCost: 1.00, freq: 1, benefit: 'Verifiable provenance for goods. ESG compliance proofs. Reduces counterfeiting. Enables faster customs clearance.' },
+  tourism: { label: 'Tourism / Travel', manualCost: 8, vcCost: 0.10, freq: 5, benefit: 'Seamless border crossings. Reduced hotel check-in friction. Enables digital health certificate integration for travel.' },
+  agriculture: { label: 'Agriculture / ESG', manualCost: 10, vcCost: 0.30, freq: 1, benefit: 'Verifiable farm-to-fork traceability. ESG credentials for carbon credits. Access to green finance for smallholder farmers.' },
+  gov_digital: { label: 'Gov Digital Services', manualCost: 6, vcCost: 0.06, freq: 6, benefit: 'Single sign-on for all government services. Reduces bureaucratic overhead. Improves service delivery speed and citizen trust.' }
+};
+
+function updateSectorExtrap() {
+  const sector = document.getElementById('sectorSelect2')?.value || 'national_id';
+  const coverage = parseInt(document.getElementById('coverageInput')?.value || 100000000);
+  const p = SECTOR_PARAMS[sector];
+  if (!p) return;
+
+  const annualVerifications = coverage * p.freq;
+  const manualTotal = annualVerifications * p.manualCost;
+  const vcTotal = annualVerifications * p.vcCost;
+  const net = manualTotal - vcTotal;
+  const paperCost = coverage * 2.5; // ~$2.50 paper doc per person
+  const reprCost = coverage * 3 * p.manualCost; // re-presenting 3× at manual cost
+
+  const cardsHTML = `
+    <div class="econ-card">
+      <div class="econ-label">Getting the doc (manual)</div>
+      <div class="econ-val" style="font-size:1.4rem">${formatBig(coverage * 6 * (avgSalary(coverage/1e6)/2000))}</div>
+      <div class="econ-sub">6 hrs × ${(coverage/1e6).toFixed(1)}M people</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Paper/physical cost</div>
+      <div class="econ-val" style="font-size:1.4rem">${formatBig(paperCost)}</div>
+      <div class="econ-sub">~$2.50 per credential</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Annual re-presenting cost</div>
+      <div class="econ-val" style="font-size:1.4rem">${formatBig(manualTotal)}</div>
+      <div class="econ-sub">${p.freq}×/yr × $${p.manualCost}/check</div>
+    </div>
+    <div class="econ-card">
+      <div class="econ-label">Net annual saving with VCs</div>
+      <div class="econ-val" style="color:var(--green);font-size:1.4rem">${formatBig(net)}</div>
+      <div class="econ-sub">vs $${p.vcCost}/VC check</div>
+    </div>
+  `;
+  const cards = document.getElementById('sectorExtrapCards');
+  if (cards) cards.innerHTML = cardsHTML;
+  const ben = document.getElementById('sectorBenefit');
+  if (ben) ben.innerHTML = '💡 <strong>' + p.label + ':</strong> ' + p.benefit;
+}
+
+// ══════════════════════════════════
+//  PAGE 3 — HOW TO BUILD
+// ══════════════════════════════════
+const SECTOR_DATA = {
+  national_id: {
+    standards: [
+      { label: 'W3C VC Data Model', cls: 'pill-blue' },
+      { label: 'ISO 18013-5 mDL', cls: 'pill-green' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    platforms: [
+      { name: 'INJI', desc: 'MOSIP-aligned wallet and issuance platform. Proven at national scale in multiple countries.' },
+      { name: 'walt.id', desc: 'Enterprise-grade SSI stack. Full W3C VC + OID4VC support with REST APIs.' }
+    ],
+    rationale: 'National ID requires both physical (mDL) and digital (W3C VC) formats. OID4VC ensures wallet interoperability. INJI provides a proven national-scale deployment path; walt.id suits custom enterprise integration.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'DID:web or DID:jwk for government issuers. Linked to existing National ID registry.' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC JSON-LD for digital presentation + ISO mDL for physical/mobile driver use.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VCI for issuance, OID4VP for presentation. Works across wallets.' },
+      { num: 'L4', label: 'Trust', desc: 'Government-run Trust Registry. Anchored to national PKI infrastructure.' }
+    ]
+  },
+  education: {
+    standards: [
+      { label: 'W3C VC Data Model', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'Open Badges 3.0', cls: 'pill-purple' }
+    ],
+    platforms: [
+      { name: 'CREDEBL', desc: 'Open-source platform purpose-built for education credentials. AnonCreds and W3C VC support.' },
+      { name: 'walt.id', desc: 'Supports Open Badges 3.0 and W3C VC. Used by European universities.' }
+    ],
+    rationale: 'Education VCs must be portable for a lifetime — W3C VC provides longevity. Open Badges 3.0 ensures recognition by employers globally. OID4VC transport ensures any wallet can receive transcripts.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'DID:web for institutions. Students use wallet-generated DIDs (DID:key or DID:jwk).' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC + Open Badges 3.0 schema. Supports selective disclosure for privacy.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VCI for issuance at graduation. OID4VP for employer verification.' },
+      { num: 'L4', label: 'Trust', desc: 'Accreditation body acts as Trust Anchor. Cross-border: use EBSI or EDUCAUSE registries.' }
+    ]
+  },
+  drivers_licence: {
+    standards: [
+      { label: 'ISO 18013-5 mDL', cls: 'pill-green' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    platforms: [
+      { name: 'INJI', desc: 'MOSIP-based wallet with mDL support. Government-grade security.' },
+      { name: 'walt.id', desc: 'Flexible mDL + W3C VC. Integrates with existing DMV/DVLA systems.' }
+    ],
+    rationale: "ISO 18013-5 is the global standard for mobile driving licences, adopted by 40+ jurisdictions. OID4VC provides the digital transport layer for online use cases beyond roadside presentation.",
+    warning: '⚠️ Apple Wallet only supports ISO mDoc format — ensure your mDL implementation is mDoc-compatible for Apple device holders.',
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'Device-bound keys per ISO 18013-5. No persistent DID needed for holder.' },
+      { num: 'L2', label: 'Format', desc: 'ISO mDL (mDoc) as primary format. W3C VC for online age/identity proofs.' },
+      { num: 'L3', label: 'Transport', desc: 'NFC/BLE for roadside (ISO 18013-5 Part 5). OID4VP for online verification.' },
+      { num: 'L4', label: 'Trust', desc: 'National DMV as Issuer. IACA (Intl Authority for mDL) trust framework.' }
+    ]
+  },
+  sme_identity: {
+    standards: [
+      { label: 'EBSI / eIDAS 2.0', cls: 'pill-purple' },
+      { label: 'W3C VC Data Model', cls: 'pill-blue' }
+    ],
+    platforms: [
+      { name: 'walt.id', desc: 'Leading EBSI-compliant platform. Used by EU governments for legal entity VCs.' },
+      { name: 'CREDEBL', desc: 'Open-source, adaptable for non-EU SME registries with W3C VC.' }
+    ],
+    rationale: 'SME identity needs legal entity credentials (LEI, company reg number). EBSI provides the European framework; W3C VC works globally. Cross-border trade requires both formats.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'DID:ebsi for EU entities. DID:web mapped to company domain globally.' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC with Legal Entity schema. Maps to LEI (Legal Entity Identifier).' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VCI for registration authority issuance. OID4VP for B2B presentation.' },
+      { num: 'L4', label: 'Trust', desc: 'Business registry (Companies House, MCA) as Trust Anchor. GLEIF for LEI.' }
+    ]
+  },
+  healthcare: {
+    standards: [
+      { label: 'AnonCreds (ZKP)', cls: 'pill-purple' },
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'HL7 FHIR', cls: 'pill-blue' }
+    ],
+    platforms: [
+      { name: 'CREDEBL', desc: 'AnonCreds support for privacy-preserving health credentials. ZKP proofs without revealing underlying data.' }
+    ],
+    rationale: 'Healthcare VCs require maximum privacy — AnonCreds enables zero-knowledge proofs (e.g. "patient is vaccinated" without revealing identity). FHIR integration ensures compatibility with existing health IT.',
+    warning: '⚠️ DIDComm transport only — OID4VP not yet available for AnonCreds. Plan for migration as standards evolve.',
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'Pairwise DIDs per issuer-holder relationship. Prevents correlation across providers.' },
+      { num: 'L2', label: 'Format', desc: 'AnonCreds for ZKP health proofs. W3C VC for vaccine certificates (WHO DDCC).' },
+      { num: 'L3', label: 'Transport', desc: 'DIDComm v2 currently. OID4VC migration path planned for 2025-26.' },
+      { num: 'L4', label: 'Trust', desc: 'Health ministry as Trust Anchor. WHO DDCC framework for cross-border.' }
+    ]
+  },
+  professional: {
+    standards: [
+      { label: 'W3C VC Data Model', cls: 'pill-blue' },
+      { label: 'EBSI', cls: 'pill-purple' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    platforms: [
+      { name: 'walt.id', desc: 'EBSI-native for European professional licences. REST APIs for issuing body integration.' },
+      { name: 'INJI', desc: 'Proven for government-issued professional credentials at national scale.' }
+    ],
+    rationale: 'Professional licences must be verifiable cross-border (e.g. doctors, engineers). W3C VC provides the format; EBSI enables EU mutual recognition; OID4VC transport ensures employer wallet compatibility.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'DID:web for professional bodies. Individual practitioners use wallet DIDs.' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC with Professional Credential schema. Includes licence number, scope, expiry.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VP for employer/regulator verification. Presentation on mobile via wallet.' },
+      { num: 'L4', label: 'Trust', desc: 'Regulatory body (BMA, Bar Council, PEO) as Trust Anchor. EBSI for EU recognition.' }
+    ]
+  },
+  age_verification: {
+    standards: [
+      { label: 'AnonCreds (ZKP)', cls: 'pill-purple' },
+      { label: 'ISO 18013-5 mDL', cls: 'pill-green' }
+    ],
+    platforms: [
+      { name: 'CREDEBL', desc: 'AnonCreds for ZKP age proofs — prove "over 18" without revealing birthdate.' },
+      { name: 'INJI', desc: 'mDL-based age verification. Interoperates with Apple/Google Wallet.' }
+    ],
+    rationale: 'Age verification is the privacy-preservation use case. AnonCreds ZKP enables binary proofs ("is over 18") without revealing identity or date of birth — ideal for online platforms.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'Ephemeral holder DIDs per session. No persistent linkability across services.' },
+      { num: 'L2', label: 'Format', desc: 'AnonCreds ZKP for pure age proofs. ISO mDL age_over_18 element for physical.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VP for online verification. NFC/BLE for physical (mDL).' },
+      { num: 'L4', label: 'Trust', desc: 'National ID authority or DMV as Trust Anchor for the source credential.' }
+    ]
+  },
+  supply_chain: {
+    standards: [
+      { label: 'W3C VC Data Model', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'GS1 Standards', cls: 'pill-green' }
+    ],
+    platforms: [
+      { name: 'walt.id', desc: 'Enterprise-grade VC issuance for supply chain proofs. REST API for ERP integration.' }
+    ],
+    rationale: 'Supply chain VCs attach to physical goods (via GS1/QR codes). W3C VC carries provenance data; OID4VC enables B2B digital transfer. GS1 ensures barcode/RFID interoperability.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'DID:web for manufacturers/certifiers. GS1 GLN mapped to DID for supply chain entities.' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC with GS1 product provenance schema. Supports batch/lot attestation.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VP for customs/buyer verification. QR code for physical goods attachment.' },
+      { num: 'L4', label: 'Trust', desc: 'Certifying body (organic, fair trade, ISO) as Trust Anchor. GS1 registry.' }
+    ]
+  },
+  tourism: {
+    standards: [
+      { label: 'ISO 18013-5 mDL', cls: 'pill-green' },
+      { label: 'OID4VC', cls: 'pill-amber' }
+    ],
+    platforms: [
+      { name: 'INJI', desc: 'Travel document integration. Supports ePassport + mDL use cases.' },
+      { name: 'walt.id', desc: 'Flexible travel credential stack. Hotel/airline integration APIs.' }
+    ],
+    rationale: 'Travel requires ISO-standard digital travel credentials for border control interoperability. OID4VC enables airline/hotel check-in flows. mDL provides the physical fallback.',
+    warning: '⚠️ Apple Wallet only supports ISO mDoc format. Test mDoc compatibility before deployment.',
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'Passport-linked DIDs. ICAO eMRTD as identity root.' },
+      { num: 'L2', label: 'Format', desc: 'ISO mDL / mDoc for mobile travel document. W3C VC for hotel/venue proofs.' },
+      { num: 'L3', label: 'Transport', desc: 'NFC for border control (ISO 18013-5). OID4VP for hotel/airline check-in.' },
+      { num: 'L4', label: 'Trust', desc: 'Issuing state passport authority. ICAO trust framework for cross-border.' }
+    ]
+  },
+  agriculture: {
+    standards: [
+      { label: 'W3C VC Data Model', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'GS1 / ISO 14064', cls: 'pill-green' }
+    ],
+    platforms: [
+      { name: 'walt.id', desc: 'Enterprise VC for ESG attestations. Integrates with carbon registries.' }
+    ],
+    rationale: 'Agriculture VCs enable verifiable farm-to-fork provenance and carbon credit attestation. W3C VC carries ESG data; ISO 14064 alignment enables carbon market participation.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'DID:web for certifying bodies. Farm/plot identifiers via GS1 GLN.' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC with AGRI-VC schema. Supports organic, fair trade, carbon attestation.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VP for buyer/regulator verification. QR code for physical product.' },
+      { num: 'L4', label: 'Trust', desc: 'Certification body (Rainforest Alliance, Verra) as Trust Anchor.' }
+    ]
+  },
+  gov_digital: {
+    standards: [
+      { label: 'W3C VC Data Model', cls: 'pill-blue' },
+      { label: 'OID4VC', cls: 'pill-amber' },
+      { label: 'EBSI', cls: 'pill-purple' }
+    ],
+    platforms: [
+      { name: 'INJI', desc: 'Proven government service stack. DigiLocker-style deployment for 1B+ users.' },
+      { name: 'walt.id', desc: 'EBSI-compliant for EU governments. REST API for legacy system integration.' },
+      { name: 'QuarkID', desc: 'Latin American government stack. ZKP + W3C VC for citizen services.' }
+    ],
+    rationale: 'Government digital services require a single VC wallet for all services — W3C VC provides the format, OID4VC the transport. EBSI enables cross-border EU service access. QuarkID covers LatAm.',
+    warning: null,
+    layers: [
+      { num: 'L1', label: 'Identifiers', desc: 'Government-issued DIDs anchored to national identity registry.' },
+      { num: 'L2', label: 'Format', desc: 'W3C VC for all service credentials. SD-JWT for selective disclosure.' },
+      { num: 'L3', label: 'Transport', desc: 'OID4VCI for government issuance. OID4VP for service authentication.' },
+      { num: 'L4', label: 'Trust', desc: 'National e-Government framework as Trust Anchor. Federated across ministries.' }
+    ]
+  }
+};
+
+function renderPage3() {
+  const sector = document.getElementById('sectorSelect3')?.value || 'national_id';
+  const d = SECTOR_DATA[sector];
+  if (!d) return;
+
+  const layerColors = ['layer-l1','layer-l2','layer-l3','layer-l4'];
+  const layerNums = ['L1','L2','L3','L4'];
+
+  let html = '';
+
+  // Standards
+  html += '<h2>Recommended Standards</h2>';
+  html += '<div class="pills-row">' + d.standards.map(s => `<span class="pill ${s.cls}">${s.label}</span>`).join('') + '</div>';
+
+  // Platforms
+  html += '<h2>Open-Source DPG Platforms</h2>';
+  html += '<div class="dpg-grid">' + d.platforms.map(p => `
+    <div class="dpg-card">
+      <div class="dpg-name">${p.name}</div>
+      <div class="dpg-desc">${p.desc}</div>
+    </div>`).join('') + '</div>';
+
+  // Rationale
+  html += '<div class="note" style="margin-bottom:1.25rem"><strong>Why these choices:</strong> ' + d.rationale + '</div>';
+
+  // Warning
+  if (d.warning) {
+    html += '<div class="warn">' + d.warning + '</div>';
+  }
+
+  // 4-layer stack
+  html += '<h2>The 4-Layer Architecture Stack</h2>';
+  html += '<div class="layer-stack">';
+  d.layers.forEach((l, i) => {
+    html += `<div class="layer ${layerColors[i]}">
+      <div class="layer-num">${l.num}</div>
+      <div class="layer-body">
+        <div class="layer-title">${l.label}</div>
+        <div class="layer-desc">${l.desc}</div>
+      </div>
+    </div>`;
+  });
+  html += '</div>';
+
+  html += '<div class="divider"></div>';
+
+  const p3Content = document.getElementById('p3Content');
+  if (p3Content) p3Content.innerHTML = html;
+}
+
+// ══════════════════════════════════
+//  INIT — wire all events here
+// ══════════════════════════════════
+document.getElementById('nav0').addEventListener('click', () => go(0));
+document.getElementById('nav1').addEventListener('click', () => go(1));
+document.getElementById('nav2').addEventListener('click', () => go(2));
+
+document.getElementById('ctaPage2').addEventListener('click', () => go(1));
+document.getElementById('ctaPage3').addEventListener('click', () => go(2));
+
+document.getElementById('countrySelect').addEventListener('change', updateEconomics);
+document.getElementById('credSlider').addEventListener('input', updateEconomics);
+
+document.querySelectorAll('.spill[data-scenario]').forEach(el => {
+  el.addEventListener('click', () => setScenario(el.dataset.scenario));
+});
+
+document.querySelectorAll('.toggle-item[data-tog]').forEach(el => {
+  el.addEventListener('click', () => toggleInfra(parseInt(el.dataset.tog)));
+});
+
+document.getElementById('extrapHeader').addEventListener('click', () => toggleCollapsible('extrapBody','extrapHeader'));
+document.getElementById('sectorSelect2').addEventListener('change', updateSectorExtrap);
+document.getElementById('coverageInput').addEventListener('input', updateSectorExtrap);
+document.getElementById('sectorSelect3').addEventListener('change', renderPage3);
+
+go(0);
+updateEconomics();
+
+// Populate sector selects
+const SECTOR_OPTIONS = [
+  ['national_id','National ID'],['education','Education'],['drivers_licence',"Driver's Licence"],
+  ['sme_identity','SME Identity'],['healthcare','Healthcare'],['professional','Professional Licences'],
+  ['age_verification','Age Verification'],['supply_chain','Supply Chain'],['tourism','Tourism / Travel'],
+  ['agriculture','Agriculture / ESG'],['gov_digital','Gov Digital Services']
+];
+['sectorSelect2','sectorSelect3'].forEach(id => {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  SECTOR_OPTIONS.forEach(([val, label]) => {
+    const o = document.createElement('option');
+    o.value = val; o.textContent = label;
+    sel.appendChild(o);
+  });
+});
+
+updateSectorExtrap();
+renderPage3();
+</script>
+
+<footer id="site-footer">
+  <div class="footer-inner">
+    <span class="footer-beta">Beta Version. Co-create with us!</span>
+    <span class="footer-sep">·</span>
+    <span class="footer-contact">Tanushka Vaid, Chief of Staff &nbsp;·&nbsp; <a href="mailto:tanushka@cdpi.dev">tanushka@cdpi.dev</a></span>
+  </div>
+</footer>
+
+</body></html>
